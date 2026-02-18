@@ -105,7 +105,7 @@ Unsupported features must return OpenAI-compatible error responses.
 -   Assumption (MVP): the priority queue provides exclusive dequeue semantics. Lease/heartbeat-based recovery for worker death is out of scope for MVP.
 
 -------------------------------------------------------------------
-**TODO***
+**TODO:**
 -   Worker Crash Recovery: If a worker crashes during `in_progress`, the job is retried from scratch upon re-queueing. Partial plan files and input artifacts are treated as temporary and discarded. Resume-from-checkpoint is not supported in MVP.
 --------------------------------------------------------------------
 ### High-Level Architecture
@@ -255,7 +255,7 @@ Renamed atomically upon completion.
 
 - Plan entry format:
 
-``` go   
+``` go
 // Plan Entry Structure (Binary, 12 bytes)
 type PlanEntry struct {
     Offset int64  // 8 bytes: Position in input.jsonl
@@ -293,7 +293,7 @@ Each plan file functions as a per-model execution queue.
 
 -------------------------------------------------------------------
 
-##### Scheduling Policy: Sticky Model + Budget (Round Robin) with Bounded Concurrency
+##### Scheduling Policy: Sticky Model + Budget (round-robin) with Bounded Concurrency
 
 ###### Scheduling and Execution Sequence
 ``` mermaid
@@ -304,15 +304,15 @@ sequenceDiagram
     participant B as Inference Backend
     participant W as Result Writer
 
-    Note over S: Round-Robin Rotation Starts
-    
+    Note over S: round-robin rotation starts
+
     loop Until All Plans Drained
         S->>S: Select Next Model (Sticky Model)
-        
+
         loop Within Model Budget & Global/Per-Model Concurrency
             S->>P: Request Plan Entry (Offset/Length)
             P-->>S: Return Entry
-            
+
             S->>E: Dispatch Request (Async)
             activate E
             E->>E: ReadAt(input.jsonl, offset, length)
@@ -320,10 +320,10 @@ sequenceDiagram
             B-->>E: Return Response
             E->>W: Send to Writing Channel
             deactivate E
-            
+
             W->>W: Append to output.jsonl
         end
-        
+
         Note over S: Switch to Next Model
     end
 
@@ -371,7 +371,7 @@ Approaches:
 -   Delete jobs from queue if not runnable
 -   Fetches job Database item
 
-#### Validator 
+#### Validator
 -   Validate job state (if runnable, expired)
 -   Check SLO
 
@@ -413,7 +413,7 @@ Approaches:
 #### Metrics (Already Implemented)
 **Job-Level Metrics**
 
-- `jobs_processed_total{result,reason}` (counter)  
+- `jobs_processed_total{result,reason}` (counter)
   Tracks total number of jobs processed with result classification:
   - `success`
   - `failed`
@@ -428,23 +428,23 @@ Approaches:
   - `expired`
   - `none`
 
-- `job_processing_duration_seconds{tenantID,size_bucket}` (histogram)  
+- `job_processing_duration_seconds{tenantID,size_bucket}` (histogram)
   Measures total job processing duration (end-to-end, including ingestion and execution).
 
-- `job_queue_wait_duration{tenantID}` (histogram)  
+- `job_queue_wait_duration{tenantID}` (histogram)
   Measures how long a job waited in the priority queue before being picked up.
 
 **Worker Utilization Metrics**
 
-- `total_workers` (gauge)  
+- `total_workers` (gauge)
   Total configured worker count (static; set during initialization).
 
-- `active_workers` (gauge)  
+- `active_workers` (gauge)
   Current number of workers actively processing jobs.
 
 **Error Metrics**
 
-- `job_errors_by_model_total{model}` (counter)  
+- `job_errors_by_model_total{model}` (counter)
   Counts job processing errors grouped by model.
 
 
@@ -452,21 +452,21 @@ Approaches:
 
 The following metrics improve visibility into scheduling behavior, concurrency control, and phase-level performance.
 
-- `processor_inflight_requests` (gauge)  
+- `processor_inflight_requests` (gauge)
   Global number of in-flight inference requests (bounded by `GlobalConcurrency`).
 
-- `plan_build_duration_seconds{tenantID,size_bucket}` (histogram)  
+- `plan_build_duration_seconds{tenantID,size_bucket}` (histogram)
   Measures Phase 1 ingestion and plan build duration.
 
-- `model_inflight_requests{model}` (gauge)  
+- `model_inflight_requests{model}` (gauge)
   Per-model in-flight request count (bounded by `PerModelConcurrency`).
 
-- `model_request_execution_duration_seconds{model}` (histogram)  
+- `model_request_execution_duration_seconds{model}` (histogram)
   Measures per-request execution duration during Phase 2.
 
 #### Metrics (Deferred / Not in MVP)
 
-- `model_queue_depth{model}`  
-  Per-model remaining plan entries.  
-  Not included in MVP due to additional state tracking complexity.  
+- `model_queue_depth{model}`
+  Per-model remaining plan entries.
+  Not included in MVP due to additional state tracking complexity.
   May be added later if required for throughput tuning or debugging.

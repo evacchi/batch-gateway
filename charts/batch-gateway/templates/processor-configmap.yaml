@@ -19,7 +19,7 @@ data:
     shutdown_timeout: {{ .Values.processor.config.shutdownTimeout | quote }}
     work_dir: {{ .Values.processor.config.workDir | quote }}
     max_open_files: {{ .Values.processor.config.maxOpenFiles }}
-    
+
     inference_config:
       gateway_url: {{ .Values.processor.config.inferenceConfig.gatewayUrl | quote }}
       request_timeout: {{ .Values.processor.config.inferenceConfig.requestTimeout | quote }}

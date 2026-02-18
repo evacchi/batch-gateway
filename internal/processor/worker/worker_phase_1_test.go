@@ -6,9 +6,11 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -142,6 +144,12 @@ func cleanMockFilesFolder(t *testing.T, folder string) {
 	t.Cleanup(func() { _ = os.RemoveAll(target) })
 }
 
+func uniqueTestFolder(t *testing.T, base string) string {
+	t.Helper()
+	testName := strings.ReplaceAll(t.Name(), "/", "_")
+	return filepath.Join(base, testName, fmt.Sprintf("%d", time.Now().UnixNano()))
+}
+
 // -------------------------
 // Test 1: Phase 1
 // - local input.jsonl exact copy (line-by-line)
@@ -161,7 +169,7 @@ func TestPreProcess_BuildsPlansAndModelMap_OffsetsCorrect(t *testing.T) {
 	filesClient := mockfiles.NewMockBatchFilesClient()
 
 	// Build remote input in mock files store
-	folder := "tenantA/job-inputs"
+	folder := uniqueTestFolder(t, "tenantA/job-inputs")
 	cleanMockFilesFolder(t, folder)
 	filename := "input.jsonl"
 	models := []string{
@@ -354,7 +362,7 @@ func TestCancelFlow_DuringPreProcess(t *testing.T) {
 		remoteBuf.Write(ln)
 	}
 
-	folder := "tenantA/cancel-test"
+	folder := uniqueTestFolder(t, "tenantA/cancel-test")
 	cleanMockFilesFolder(t, folder)
 	filename := "input.jsonl"
 	if _, err := filesClient.Store(ctx, filename, folder, 0, 0, bytes.NewReader(remoteBuf.Bytes())); err != nil {
