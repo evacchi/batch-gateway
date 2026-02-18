@@ -8,13 +8,28 @@ metadata:
 data:
   config.yaml: |
     # Processor configuration
-    # NOTE: This is a placeholder - processor is not code-ready yet
 
     addr: {{ .Values.processor.config.addr | quote }}
     task_wait_time: {{ .Values.processor.config.taskWaitTime | quote }}
     poll_interval: {{ .Values.processor.config.pollInterval | quote }}
     num_workers: {{ .Values.processor.config.numWorkers }}
     max_job_concurrency: {{ .Values.processor.config.maxJobConcurrency }}
+
+    terminate_on_observability_failure: {{ .Values.processor.config.terminateOnObservabilityFailure }}
+    shutdown_timeout: {{ .Values.processor.config.shutdownTimeout | quote }}
+    work_dir: {{ .Values.processor.config.workDir | quote }}
+    max_open_files: {{ .Values.processor.config.maxOpenFiles }}
+    
+    inference_config:
+      gateway_url: {{ .Values.processor.config.inferenceConfig.gatewayUrl | quote }}
+      request_timeout: {{ .Values.processor.config.inferenceConfig.requestTimeout | quote }}
+      max_retries: {{ .Values.processor.config.inferenceConfig.maxRetries }}
+      initial_backoff: {{ .Values.processor.config.inferenceConfig.initialBackoff | quote }}
+      max_backoff: {{ .Values.processor.config.inferenceConfig.maxBackoff | quote }}
+      tls_insecure_skip_verify: {{ .Values.processor.config.inferenceConfig.tlsInsecureSkipVerify }}
+      tls_ca_cert_file: {{ .Values.processor.config.inferenceConfig.tlsCaCertFile | default "" | quote }}
+      tls_client_cert_file: {{ .Values.processor.config.inferenceConfig.tlsClientCertFile | default "" | quote }}
+      tls_client_key_file: {{ .Values.processor.config.inferenceConfig.tlsClientKeyFile | default "" | quote }}
 
     queue_time_bucket:
       bucket_start: {{ .Values.processor.config.queueTimeBucket.bucketStart }}

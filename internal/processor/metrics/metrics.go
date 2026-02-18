@@ -25,15 +25,32 @@ import (
 
 // labels definition
 const (
-	// result labels
-	ResultSuccess = "success"
-	ResultFailed  = "failed"
+	// -- Result --
+	// ResultSuccess: Job reached a terminal state treated as success by policy (completed; cancelled is treated as success because it is user-initiated).
+	// ResultFailed: Job is failed and updated to failed status in the db
+	// ResultSkipped: Job was not processed by this worker (e.g. already terminal, not runnable, expired, data inconsistency)
+	// ResultReEnqueued: Job was re-enqueued for retry due to transient backend/system issues
 
-	// reason lables
-	ReasonUnknown     = "unknown"      // unknown reason
-	ReasonUserError   = "user_error"   // method, request validation failed.. etc.,
-	ReasonSystemError = "system_error" // SLO failed, system error.. etc.,
-	ReasonNone        = "none"         // job is successfully completed
+	// Result labels
+	ResultSuccess    = "success"
+	ResultFailed     = "failed"
+	ResultSkipped    = "skipped"
+	ResultReEnqueued = "re_enqueued"
+
+	// -- Reason --
+	// - If expired, reason is expired
+	// - If data inconsistency, use db_inconsistency
+	// - If retryable backend error, use db_transient
+	// - If not runnable, reason is not runnable state
+	// - Otherwise, fall back to system_error
+
+	// Reason labels
+	ReasonSystemError      = "system_error"       // unexpected internal errors (panic, serialization failure, invariant violation)
+	ReasonDBTransient      = "db_transient"       // temporary backend/storage error; safe to retry
+	ReasonDBInconsistency  = "db_inconsistency"   // PQ item exists but DB item missing or corrupted
+	ReasonNotRunnableState = "not_runnable_state" // job status is not runnable by processor policy
+	ReasonExpired          = "expired"            // job exceeded SLO deadline
+	ReasonNone             = "none"               // job completed successfully
 
 	// size bucket labels
 	Bucket100   = "100"   // less than 100 lines

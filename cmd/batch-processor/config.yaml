@@ -3,8 +3,8 @@ database_url: ""
 
 # Worker Settings - task wait time needs to be shorter than poll interval
 task_wait_time: "1s"
-worker_poll_interval: "5s"
-max_workers: 20
+poll_interval: "5s"
+num_workers: 20
 queue_time_bucket:
   bucket_start: 0.1
   bucket_factor: 2
@@ -14,8 +14,19 @@ process_time_bucket:
   bucket_factor: 2
   bucket_count: 15
 
-# Metrics & Health Check Server Address
+# Metrics & Health Check Server Address - ":PORT" format (e.g. ":9090")
 addr: ":9090"
+# Observability server failure should not terminate the processor in best-effort mode by default.
+terminate_on_observability_failure: false
+
+# Shutdown timeout for processor (should be less than k8s terminationGracePeriodSeconds)
+shutdown_timeout: "30s"
+
+# Work directory for processor
+work_dir: "/var/lib/batch-gateway/processor"
+
+# Maximum number of open files for the plan writer (unlimited if <= 0)
+max_open_files: 50
 
 # Inference Client Configuration
 inference_config:

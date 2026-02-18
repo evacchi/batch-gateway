@@ -19,6 +19,7 @@ limitations under the License.
 package config
 
 import (
+	"fmt"
 	"os"
 	"time"
 
@@ -45,9 +46,21 @@ type ProcessorConfig struct {
 	// ProcessTimeBucket defines exponential bucket configs for process time metric
 	ProcessTimeBucket BucketConfig `yaml:"process_time_bucket"`
 
+	// MaxOpenFiles is the maximum number of open files for the plan writer
+	MaxOpenFiles int `yaml:"max_open_files"`
+
 	Addr        string `yaml:"addr"`
 	SSLCertFile string `yaml:"ssl_cert_file"`
 	SSLKeyFile  string `yaml:"ssl_key_file"`
+	// TerminateOnObservabilityFailure controls whether observability server failures should terminate the processor.
+	// false: best-effort (default), true: fatal.
+	TerminateOnObservabilityFailure bool `yaml:"terminate_on_observability_failure"`
+
+	// ShutdownTimeout is the timeout for shutting down the processor
+	ShutdownTimeout time.Duration `yaml:"shutdown_timeout"`
+
+	// WorkDir is the work directory for processor
+	WorkDir string `yaml:"work_dir"`
 
 	// Inference Config
 	InferenceConfig InferenceConfig `yaml:"inference_config"`
@@ -130,7 +143,11 @@ func NewConfig() *ProcessorConfig {
 		MaxJobConcurrency: 10,
 		NumWorkers:        1,
 		Addr:              ":9090",
-
+		// Keep observability as best-effort by default.
+		TerminateOnObservabilityFailure: false,
+		ShutdownTimeout:                 30 * time.Second,
+		WorkDir:                         "/var/lib/batch-gateway/processor",
+		MaxOpenFiles:                    50, // default to 50 open files
 		InferenceConfig: InferenceConfig{
 			GatewayURL:            "http://localhost:8000",
 			RequestTimeout:        5 * time.Minute,
@@ -151,6 +168,9 @@ func (c *ProcessorConfig) Validate() error {
 		if _, err := os.Stat(c.SSLKeyFile); err != nil {
 			return err
 		}
+	}
+	if c.WorkDir == "" {
+		return fmt.Errorf("work_dir cannot be empty")
 	}
 	return nil
 }

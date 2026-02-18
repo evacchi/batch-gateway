@@ -19,13 +19,18 @@ package worker
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
+	"os"
+	"sort"
+	"sync"
 	"sync/atomic"
 	"time"
 
-	"golang.org/x/sync/errgroup"
 	"k8s.io/klog/v2"
 
 	db "github.com/llm-d-incubation/batch-gateway/internal/database/api"
@@ -66,23 +71,49 @@ func NewProcessorClients(
 }
 
 type Processor struct {
-	cfg        *config.ProcessorConfig
-	workerPool *WorkerPool
+	cfg    *config.ProcessorConfig
+	tokens chan struct{}
+	wg     sync.WaitGroup
 
 	clients *ProcessorClients
 }
+
+var ErrCancelled = errors.New("batch job cancelled")
 
 func NewProcessor(
 	cfg *config.ProcessorConfig,
 	clients *ProcessorClients,
 ) *Processor {
+	sem := make(chan struct{}, cfg.NumWorkers)
+	for i := 0; i < cfg.NumWorkers; i++ {
+		sem <- struct{}{}
+	}
 	return &Processor{
-		cfg:        cfg,
-		workerPool: NewWorkerPool(cfg.NumWorkers),
-		clients:    clients,
+		cfg:     cfg,
+		tokens:  sem,
+		clients: clients,
 	}
 }
 
+func (p *Processor) acquire(ctx context.Context) bool {
+	select {
+	case <-ctx.Done():
+		return false
+	case <-p.tokens:
+		return true
+	}
+}
+
+func (p *Processor) release() {
+	select {
+	case p.tokens <- struct{}{}:
+		return
+	default:
+		panic("token channel is full (double release?)")
+	}
+}
+
+// TODO:: need to add detailed validation here for each client.
 func (pc *ProcessorClients) Validate() error {
 	if pc.database == nil {
 		return fmt.Errorf("database client is missing")
@@ -105,7 +136,7 @@ func (pc *ProcessorClients) Validate() error {
 	return nil
 }
 
-// pre-flight check - need to add more checks here
+// pre-flight check
 func (p *Processor) prepare(ctx context.Context) error {
 	logger := klog.FromContext(ctx)
 
@@ -117,7 +148,13 @@ func (p *Processor) prepare(ctx context.Context) error {
 	return nil
 }
 
-// RunPollingLoop runs the main job polling loop for the processor, try assign the job to the worker,
+// RunPollingLoop runs the main job polling loop for the processor
+// it waits until a worker is available,
+// then dequeues one job from the queue,
+// assign the job to the available worker
+// fetches the job item from the db,
+// validates the job checking if it is runnable and not expired,
+// then proceed with processing
 func (p *Processor) RunPollingLoop(ctx context.Context) error {
 	if err := p.prepare(ctx); err != nil {
 		return err
@@ -129,468 +166,470 @@ func (p *Processor) RunPollingLoop(ctx context.Context) error {
 		"maxWorkers", p.cfg.NumWorkers,
 	)
 
+	poller := NewPoller(p.clients.priorityQueue, p.clients.database)
+	updater := NewStatusUpdater(p.clients.database, p.clients.status)
+
 	// worker driven non-busy wait
 	for {
-		var workerID int
-		select {
-		case <-ctx.Done():
+		if !p.acquire(ctx) {
 			return nil
-		case id, ok := <-p.workerPool.workerIDs: // wait until at least one worker is available
-			if !ok {
-				return nil
-			}
-			workerID = id
 		}
 
 		// check queue for available tasks
-		task := p.getTaskFromQueue(ctx)
+		task, err := poller.DequeueOne(ctx)
+
+		// polling error
+		if err != nil {
+			p.release()
+			continue
+		}
 
 		// when there's no waiting tasks in the queue
 		if task == nil {
-			p.workerPool.Release(workerID)
+			p.release()
 			// wait for poll interval to protect db from frequent queueing
 			select {
 			case <-ctx.Done():
 				return nil
-			case <-time.After(p.cfg.PollInterval): // wait for poll interval to protect db from frequent queueing if no tasks are available
+			case <-time.After(p.cfg.PollInterval):
 				continue
 			}
 		}
 
-		// queue wait should be recorded here
-		// TODO:: metrics.RecordQueueWait(time.Since(task.EnqueuedAt), tenantID)
+		// create a new logger for the job
+		jlogger := klog.FromContext(ctx).WithValues("jobId", task.ID)
+		jctx := klog.NewContext(ctx, jlogger)
 
-		// get detailed job info from db for processor
-		jobDbData, err := p.getJobData(ctx, task)
+		// get job item from db
+		jobItem, err := poller.FetchJobItem(jctx, task)
 		if err != nil {
-			// this task should be skipped as the data is not in db
-			// enqueue/dequeue is handled in the getJobData function
-			p.workerPool.Release(workerID)
-			metrics.RecordJobProcessed(metrics.ResultFailed, metrics.ReasonSystemError)
-			// we don't have enough information to record job processing duration and errored model (missing tenantID, modelID)
-			// we don't have enough information to update the job status in the db
+			p.release()
+			// poller re-enqueued the task if the error is due to temporary issue (db connection, etc.)
+			metrics.RecordJobProcessed(metrics.ResultReEnqueued, metrics.ReasonDBTransient)
 			continue
 		}
 
-		// process job (read downloaded file, process requests line by line, write responses to the output file)
-		go func(c context.Context, wid int, j *db.BatchItem) {
+		// job item is not found in the db.
+		if jobItem == nil {
+			// poller deleted the task from the queue.
+			p.release()
+			metrics.RecordJobProcessed(metrics.ResultSkipped, metrics.ReasonDBInconsistency)
+			continue
+		}
+
+		// queue wait metrics recording
+		if jobPriorityData, err := batch_utils.GetJobPriorityDataFromQueueItem(task); err == nil {
+			queueWait := time.Since(time.Unix(jobPriorityData.CreatedAt, 0))
+			metrics.RecordQueueWaitDuration(queueWait, jobItem.TenantID)
+		} else {
+			// queue createdAt is not available.
+			// log the error and continue processing as createdAt is only for metrics recording.
+			jlogger.V(logging.ERROR).Error(err, "Failed to get job priority data from queue item")
+		}
+
+		// job status validation
+		jobInfo, err := batch_utils.FromDBItemToJobInfoObject(jobItem)
+
+		if err != nil {
+			jlogger.V(logging.ERROR).Error(err, "Failed to convert job object in DB to job info object")
+			p.release()
+			metrics.RecordJobProcessed(metrics.ResultFailed, metrics.ReasonSystemError)
+			continue
+		}
+
+		if !task.SLO.IsZero() && time.Now().After(task.SLO) {
+			jlogger.V(logging.INFO).Info("Job is expired.")
+
+			// persistent status update
+			if err := updater.UpdatePersistentStatus(jctx, jobItem, openai.BatchStatusExpired, nil, nil); err != nil {
+				jlogger.V(logging.ERROR).Error(err, "Failed to update job status in DB", "newStatus", openai.BatchStatusExpired, "slo", task.SLO)
+			}
+
+			// delete the task from the queue.
+			if _, err := p.clients.priorityQueue.PQDelete(jctx, task); err != nil {
+				jlogger.V(logging.ERROR).Error(err, "Failed to delete the task from the queue", "slo", task.SLO)
+			}
+
+			p.release()
+			metrics.RecordJobProcessed(metrics.ResultSkipped, metrics.ReasonExpired)
+			continue
+		}
+
+		// job is not in runnable state.
+		if !batch_utils.IsJobRunnable(jobInfo.BatchJob) {
+			jlogger.V(logging.INFO).Info("job is not in processible state. skipping this job.", "status", jobInfo.BatchJob.BatchStatusInfo.Status)
+
+			// persistent status update is not needed.
+			// delete the task from the queue as it is not processible.
+			if _, err := p.clients.priorityQueue.PQDelete(jctx, task); err != nil {
+				jlogger.V(logging.ERROR).Error(err, "Failed to delete the task from the queue", "slo", task.SLO)
+			}
+
+			p.release()
+			metrics.RecordJobProcessed(metrics.ResultSkipped, metrics.ReasonNotRunnableState)
+			continue
+		}
+
+		// process job
+		p.wg.Add(1)
+		go func(c context.Context, jobItem *db.BatchItem, jobInfo *batch_utils.JobInfo, task *db.BatchJobPriority) {
+			defer p.wg.Done()
+			defer p.release()
 			defer func() {
 				if r := recover(); r != nil {
 					recoverErr := fmt.Errorf("%v", r)
-					logger.V(logging.ERROR).Error(recoverErr, "Panic recovered", "workerID", wid)
+					klog.FromContext(c).V(logging.ERROR).Error(recoverErr, "Panic recovered")
 				}
-				p.workerPool.Release(wid)
-				metrics.DecActiveWorkers()
 			}()
 
 			metrics.IncActiveWorkers()
-			p.processJob(c, wid, j)
-		}(ctx, workerID, jobDbData)
-	}
-}
+			defer metrics.DecActiveWorkers()
 
-// getTask is executed when at least one worker is available
-func (p *Processor) getTaskFromQueue(ctx context.Context) *db.BatchJobPriority {
-	logger := klog.FromContext(ctx)
+			// event watcher for cancel event
+			eventWatcher, err := p.clients.event.ECConsumerGetChannel(c, jobInfo.JobID)
+			if err != nil {
+				jlogger.V(logging.ERROR).Error(err, "Failed to get event watcher")
+				return
+			}
+			defer eventWatcher.CloseFn()
 
-	tasks, err := p.clients.priorityQueue.PQDequeue(ctx, 0, 1) // get only one job without blocking the queue
-	if err != nil {
-		logger.V(logging.ERROR).Error(err, "Failed to dequeue a batch job")
-		return nil
-	}
+			// cancel requested flag and cancelling once
+			var cancelRequested atomic.Bool
+			var cancellingOnce sync.Once
 
-	// there's no backlog
-	if len(tasks) == 0 {
-		logger.V(logging.TRACE).Info("No jobs to fetch")
-		return nil
-	}
+			// watch for cancel event
+			go p.watchCancel(c, eventWatcher, updater, jobItem, &cancelRequested, &cancellingOnce)
 
-	logger.V(logging.DEBUG).Info("Successfully fetched a job", "jobID", tasks[0].ID)
-	return tasks[0]
-}
+			// pre-process job
+			if err := p.preProcessJob(c, jobInfo, &cancelRequested); err != nil {
+				switch {
+				case errors.Is(err, ErrCancelled):
+					if cancelErr := p.handleCancelled(c, jobItem, updater, task); cancelErr != nil {
+						jlogger.V(logging.ERROR).Error(cancelErr, "Failed to handle cancelled event")
+					}
+					return
 
-// getJobData gets job's db data
-func (p *Processor) getJobData(ctx context.Context, task *db.BatchJobPriority) (*db.BatchItem, error) {
-	logger := klog.FromContext(ctx)
+				case errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded):
+					// processor shutdown / job context cancelled
+					// re-enqueue the job to the queue so this job can be picked up by another worker
+					// use background context to avoid context cancellation error
+					if task != nil {
+						if enqErr := p.clients.priorityQueue.PQEnqueue(context.Background(), task); enqErr != nil {
+							jlogger.V(logging.ERROR).Error(enqErr, "Failed to re-enqueue the job to the queue")
+						} else {
+							jlogger.V(logging.INFO).Info("Re-enqueued the job to the queue")
+						}
+					}
+					return
 
-	// get only one job data
-	ids := []string{task.ID}
-	jobs, _, _, err := p.clients.database.DBGet(ctx,
-		&db.BatchDBQuery{
-			IDs: ids,
-		},
-		true, 0, 1)
-
-	// system error. (db connection, etc. temporary error)
-	if err != nil {
-		logger.V(logging.ERROR).Error(err, "Temporary DB error. Re-enqueueing the task.")
-		if enqueueErr := p.clients.priorityQueue.PQEnqueue(ctx, task); enqueueErr != nil {
-			logger.V(logging.ERROR).Error(enqueueErr, "CRITICAL: Failed to re-enqueue job", "jobID", task.ID)
-		}
-		return nil, err
-	}
-
-	// data inconsistency. job data is not in the db while the task is in the queue.
-	// re-enqueue might create a zombie job. return error.
-	if len(jobs) == 0 {
-		jobDataErr := fmt.Errorf("Job data for %s does not exist", task.ID)
-		logger.V(logging.ERROR).Error(jobDataErr, "CRITICAL: Job data is not in the DB while the task is in the queue. Returning error.")
-		return nil, fmt.Errorf("Job data for %s does not exist", task.ID)
-	}
-
-	logger.V(logging.DEBUG).Info("Job DB Data retrieved", "jobID", task.ID)
-	return jobs[0], nil
-}
-
-// TODO:: status updates and re-enqueue the job if needed
-func (p *Processor) processJob(ctx context.Context, workerID int, jobDbData *db.BatchItem) {
-	// logger and ctx
-	logger := klog.FromContext(ctx).WithValues("jobID", jobDbData.ID, "workerID", workerID)
-	jobctx := klog.NewContext(ctx, logger)
-	logger.V(logging.DEBUG).Info("Worker started")
-
-	// convert db job data to openai batch object
-	job, err := batch_utils.FromDBToJobInfo(jobDbData)
-	if err != nil {
-		logger.V(logging.ERROR).Error(err, "Failed to convert job object in DB to batch object")
-		metrics.RecordJobProcessed(metrics.ResultFailed, metrics.ReasonSystemError)
-		// skipped metrics: job processing duration / job error details
-		// job processing duration recording (missing tenantID, sizeBucket)
-		// job error recording (missing modelID)
-		batch_utils.UpdateDBJobStatus(p.clients.database, p.clients.status, jobctx, jobDbData, openai.BatchStatusFailed, nil, nil)
-		return
-	}
-
-	// check if the job is expired
-	if batch_utils.IsJobExpired(job.BatchJob) {
-		logger.V(logging.INFO).Info("Job is expired.")
-		// update the job status to expired
-		if err := batch_utils.UpdateDBJobStatus(p.clients.database, p.clients.status, jobctx, jobDbData, openai.BatchStatusExpired, nil, nil); err != nil {
-			logger.V(logging.ERROR).Error(err, "Failed to update job status to %s in DB. skipping this job.", openai.BatchStatusExpired)
-		}
-		// metrics
-		metrics.RecordJobProcessed(metrics.ResultFailed, metrics.ReasonSystemError)
-		metrics.RecordJobError(job.BatchJob.BatchStatusInfo.Model)
-		return
-	}
-
-	// get event channel for the job
-	eventsChan, err := p.clients.event.ECConsumerGetChannel(ctx, job.JobID)
-	if err != nil {
-		logger.V(logging.ERROR).Error(err, "Failed to get event channel")
-		metrics.RecordJobProcessed(metrics.ResultFailed, metrics.ReasonSystemError)
-		metrics.RecordJobError(job.BatchJob.BatchStatusInfo.Model)
-		// we don't have enough information to record job processing duration(missing sizeBucket)
-		if err = batch_utils.UpdateDBJobStatus(p.clients.database, p.clients.status, ctx, jobDbData, openai.BatchStatusFailed, nil, nil); err != nil {
-			logger.V(logging.ERROR).Error(err, "Failed to update job status to %s in DB. skipping this job.", openai.BatchStatusFailed)
-		}
-		return
-	}
-
-	// atomic request counts
-	var (
-		totalRequests     int64 = 0
-		completedRequests int64 = 0
-		failedRequests    int64 = 0
-	)
-
-	requestCounts := &openai.BatchRequestCounts{
-		Total:     atomic.LoadInt64(&totalRequests),
-		Completed: atomic.LoadInt64(&completedRequests),
-		Failed:    atomic.LoadInt64(&failedRequests),
-	}
-
-	// initialize job result record values
-	jobFailureReason := metrics.ReasonNone
-	jobResult := metrics.ResultSuccess
-	startTime := time.Now()
-
-	// check if the job is in processible status
-	if !batch_utils.IsJobProcessible(job.BatchJob) {
-		logger.V(logging.ERROR).Error(fmt.Errorf("job is not in processible status"), "Failed to update job status to %s in DB. skipping this job.", openai.BatchStatusInProgress)
-		// skip metrics recording and status update as they've been done in another process
-		return
-	}
-
-	// status update - in_progress
-	if err := batch_utils.UpdateDBJobStatus(p.clients.database, p.clients.status, jobctx, jobDbData, openai.BatchStatusInProgress, requestCounts, nil); err != nil {
-		logger.V(logging.ERROR).Error(err, "Failed to update job status to %s in DB. updating to failed instead.", openai.BatchStatusInProgress)
-	}
-
-	// limit goroutines using config's max job concurrency
-	// limit + 2: 1 for file reader/dispatcher, 1 for writer, max job concurrency for inference requests
-	processPipelineGroup, processPipelineCtx := errgroup.WithContext(ctx)
-	processPipelineGroup.SetLimit(p.cfg.MaxJobConcurrency + 2)
-
-	resultChan := make(chan *batch_utils.Response, p.cfg.MaxJobConcurrency)
-
-	// file download - get file reader
-	fileReader, _, err := p.openInputFileStream(jobctx, job.BatchJob.InputFileID)
-	if err != nil {
-		logger.V(logging.ERROR).Error(err, "Failed to open input file stream")
-		metrics.RecordJobProcessed(metrics.ResultFailed, metrics.ReasonSystemError)
-		// skipped metrics: job processing duration / job error details
-		// job processing duration recording (missing tenantID, sizeBucket)
-		// job error recording (missing modelID)
-		updateErr := batch_utils.UpdateDBJobStatus(p.clients.database, p.clients.status, jobctx, jobDbData, openai.BatchStatusFailed, nil, nil)
-		if updateErr != nil {
-			logger.V(logging.ERROR).Error(updateErr, "Failed to update job status to %s in DB. skipping this job.", openai.BatchStatusFailed)
-		}
-		return
-	}
-
-	// writer goroutine to write the responses to the output file
-	var localoutputPath string
-	processPipelineGroup.Go(func() error {
-		localoutputPath, err = p.writeResultsToFileLoop(processPipelineCtx, job.JobID, resultChan)
-		if err != nil {
-			return err // critical error. processPipelineCtx should be cancelled.
-		}
-		job.BatchJob.OutputFileID = localoutputPath
-		return nil
-	})
-
-	// reader + dispatcher goroutine to process the requests
-	processPipelineGroup.Go(func() error {
-		// defer closing the file reader & result channel
-		defer func() {
-			fileReader.Close()
-			close(resultChan)
-		}()
-
-		// read the input file line by line
-		fileStreamScanner := bufio.NewScanner(fileReader)
-		for fileStreamScanner.Scan() {
-			// context check before each line processing
-			select {
-			case <-processPipelineCtx.Done(): // critical error occured in the group. need to stop the loop immediately
-				return processPipelineCtx.Err() // stops the whole errGroup
-			case <-jobctx.Done(): // process received cancellation request. need to stop the loop immediately
-				logger.V(logging.INFO).Info("Job processing stopped due to system shutdown signal.")
-				if err := batch_utils.UpdateRequestCountsStatus(p.clients.status, processPipelineCtx, job.JobID, requestCounts); err != nil {
-					logger.V(logging.ERROR).Error(err, "Failed to update request counts status", "requestCounts", requestCounts)
-					// non critical error. continue the shutdown process
-				}
-
-				// local file is deleted by the writer goroutine
-				// status update in-progress and re-enqueue the job so we can try again
-				if err := batch_utils.UpdateDBJobStatus(p.clients.database, p.clients.status, jobctx, jobDbData, openai.BatchStatusInProgress, requestCounts, nil); err != nil {
-					logger.V(logging.ERROR).Error(err, "Failed to update job status to %s in DB. skipping this job.", openai.BatchStatusInProgress)
-					// non critical error. continue the shutdown process
-				}
-
-				// TODO:: get SLO from the job db data once it's included in the data.spec
-				// taskToEnqueue := &db.BatchJobPriority{
-				// 	ID:  jobDbData.ID,
-				// 	SLO: jobDbData.SLO,
-				// }
-				// if err := p.clients.priorityQueue.Enqueue(processPipelineCtx, taskToEnqueue); err != nil {
-				// 	logger.V(logging.ERROR).Error(err, "Failed to re-enqueue job", "jobID", jobDbData.ID)
-				// 	// critial error but we can't do anything about it. continue the shutdown process
-				// }
-
-				// metrics: skipped as the job is not completed successfully
-
-				// exit the loop safely
-				return nil
-			case ev := <-eventsChan.Events:
-				switch ev.Type {
-				case db.BatchEventCancel:
-					logger.V(logging.INFO).Info("Received cancellation request. cancelling the processing pipeline")
-
-					// status update to cancelling
-					if err := batch_utils.UpdateDBJobStatus(p.clients.database, p.clients.status, jobctx, jobDbData, openai.BatchStatusCancelling, requestCounts, nil); err != nil {
-						logger.V(logging.ERROR).Error(err, "Failed to update job status to %s in DB. skipping this job.", openai.BatchStatusCancelling)
-						// critical error. but we can't do anything about it. continue the cancel process
+				default:
+					// treat as failed job
+					if failUpdateErr := updater.UpdatePersistentStatus(c, jobItem, openai.BatchStatusFailed, nil, nil); failUpdateErr != nil {
+						jlogger.V(logging.ERROR).Error(failUpdateErr, "Failed to update status to failed in DB")
 					}
 
-					// exit the loop safely
-					return fmt.Errorf("job cancelled")
-					/*case db.BatchEventPause:
-						logger.Info("Job paused by user. Waiting for resume request.")
-
-						// wait for resume request
-					PauseLoop:
-						for {
-							select {
-							case <-processPipelineCtx.Done():
-								return processPipelineCtx.Err()
-							case resEv := <-eventsChan.Events:
-								if resEv.Type == db.BatchEventResume {
-									break PauseLoop
-								}
-								if resEv.Type == db.BatchEventCancel {
-									logger.V(logging.INFO).Info("Received cancellation request. cancelling the processing pipeline")
-
-									// status update to cancelling
-									if err := batch_utils.UpdateDBJobStatus(p.clients.database, p.clients.status, jobctx, jobDbData, openai.BatchStatusCancelling, requestCounts, nil); err != nil {
-										logger.V(logging.ERROR).Error(err, "Failed to update job status to %s in DB. skipping this job.", openai.BatchStatusCancelling)
-										// critical error. but we can't do anything about it. continue the cancel process
-									}
-									// exit the loop safely
-									return fmt.Errorf("job cancelled")
-								}
-							}
+					// best-effort delete the job from the queue if it's still there
+					if task != nil {
+						if nDeleted, delErr := p.clients.priorityQueue.PQDelete(context.Background(), task); delErr != nil {
+							jlogger.V(logging.ERROR).Error(delErr, "Failed to delete the job from the queue")
+						} else if nDeleted == 0 {
+							jlogger.V(logging.INFO).Info("Job is not in the queue anymore")
 						}
-					*/
+					}
+
+					metrics.RecordJobProcessed(metrics.ResultFailed, metrics.ReasonSystemError)
+
+					return
 				}
-
-			default:
+			} else {
+				// phase 2
+				// p.processJob(c, jobItem, jobInfo, &cancelRequested)
 			}
-
-			// read one line at a time
-			line := fileStreamScanner.Text()
-
-			// validate the request line's method and request body format
-			if err := p.validateLine(line); err != nil {
-				logger.V(logging.ERROR).Error(err, "Failed to validate request line")
-				atomic.AddInt64(&failedRequests, 1)
-				atomic.AddInt64(&totalRequests, 1)
-				resultChan <- &batch_utils.Response{
-					ID:       "",
-					CustomID: "",
-					Response: nil,
-					Error: &inference.ClientError{
-						Category: inference.ErrCategoryInvalidReq,
-						Message:  err.Error(),
-						RawError: err,
-					},
-				}
-				continue
-			}
-			// increase request counts
-			atomic.AddInt64(&totalRequests, 1)
-			// update request counts status
-			if err := batch_utils.UpdateRequestCountsStatus(p.clients.status, processPipelineCtx, job.JobID, requestCounts); err != nil {
-				logger.V(logging.ERROR).Error(err, "Failed to update request counts status", "requestCounts", requestCounts)
-				// non critical error. continue the loop
-			}
-			// send the request to the inference server
-			processPipelineGroup.Go(func() error {
-				currentLine := line
-				// send the request to the inference server >> result sent to resultchan
-				p.doInferenceRequest(processPipelineCtx, currentLine, resultChan, &completedRequests, &failedRequests)
-				// update request counts status
-				if err := batch_utils.UpdateRequestCountsStatus(p.clients.status, processPipelineCtx, job.JobID, requestCounts); err != nil {
-					logger.V(logging.ERROR).Error(err, "Failed to update temp status", "requestCounts", requestCounts)
-					// non critical error. continue the loop
-				}
-				return nil
-			})
-		}
-		return nil
-	})
-
-	if err := processPipelineGroup.Wait(); err != nil {
-		if err.Error() == "job cancelled" {
-			logger.V(logging.INFO).Info("Job processing stopped due to user cancellation.")
-
-			// cancelled jobs are considered as successful jobs (no failure)
-			jobResult = metrics.ResultSuccess
-
-			// metrics recording
-			metrics.RecordJobProcessed(jobResult, jobFailureReason)
-			metrics.RecordJobProcessingDuration(time.Since(startTime), job.TenantID, metrics.GetSizeBucket(int(requestCounts.Total)))
-
-			// status update to cancelled
-			batch_utils.UpdateDBJobStatus(p.clients.database, p.clients.status, jobctx, jobDbData, openai.BatchStatusCancelled, requestCounts, nil)
-			return
-		}
-		logger.V(logging.ERROR).Error(err, "Failed to execute job processing pipeline")
-		jobResult = metrics.ResultFailed
-		metrics.RecordJobProcessed(metrics.ResultFailed, metrics.ReasonSystemError)
-		// skipped metrics: job processing duration / job error details
-		// job processing duration recording (missing tenantID, sizeBucket)
-		// job error recording (missing modelID)
-		updateErr := batch_utils.UpdateDBJobStatus(p.clients.database, p.clients.status, jobctx, jobDbData, openai.BatchStatusFailed, nil, nil)
-		if updateErr != nil {
-			logger.V(logging.ERROR).Error(updateErr, "Failed to update job status to %s in DB. skipping this job.", openai.BatchStatusFailed)
-		}
-		return
-	}
-
-	logger.V(logging.INFO).Info("Job processing completed successfully.")
-	jobResult = metrics.ResultSuccess
-	metrics.RecordJobProcessed(jobResult, jobFailureReason)
-	metrics.RecordJobProcessingDuration(time.Since(startTime), job.TenantID, metrics.GetSizeBucket(int(requestCounts.Total)))
-	metrics.RecordJobError(job.BatchJob.BatchStatusInfo.Model)
-	if err := batch_utils.UpdateDBJobStatus(p.clients.database, p.clients.status, jobctx, jobDbData, openai.BatchStatusCompleted, requestCounts, nil); err != nil {
-		logger.V(logging.ERROR).Error(err, "Failed to update job status to %s in DB.", openai.BatchStatusCompleted)
+		}(jctx, jobItem, jobInfo, task)
 	}
 }
 
-func (p *Processor) doInferenceRequest(
+// preProcessJob performs the pre-processing steps for the job
+// it downloads the input file from the files store in job work folder : jobs/<jobid>/input.jsonl,
+// creates the plan per model, while saving the input file in the work folder.
+// temp plan file is saved in the work folder's subfolder while creating the plan (jobs/<jobid>/plans/<modelid>.plan.tmp)
+// then the temp plan file is renamed to the final plan file (jobs/<jobid>/plans/<modelid>.plan)
+func (p *Processor) preProcessJob(ctx context.Context, jobInfo *batch_utils.JobInfo, cancelRequested *atomic.Bool) error {
+	logger := klog.FromContext(ctx)
+	logger.V(logging.INFO).Info("Pre-processing job") // job id is in the logger already
+	jobID := jobInfo.JobID
+	inputFileId := jobInfo.BatchJob.BatchSpec.InputFileID
+	if inputFileId == "" {
+		err := fmt.Errorf("input file ID is empty")
+		logger.V(logging.ERROR).Error(err, "Input file ID is empty")
+		return err
+	}
+
+	jobRootDir := p.jobRootDir(jobID)
+
+	// job directory creation
+	if err := os.MkdirAll(jobRootDir, 0o755); err != nil {
+		logger.V(logging.ERROR).Error(err, "Failed to create job root directory", "jobRootDir", jobRootDir)
+		return err
+	}
+
+	// input file stream open
+	reader, metadata, err := p.openInputFileStream(ctx, inputFileId)
+	if err != nil {
+		logger.V(logging.ERROR).Error(err, "Failed to open input file stream", "inputFileId", inputFileId)
+		return err
+	}
+	defer reader.Close()
+
+	if metadata != nil {
+		logger.V(logging.INFO).Info("Input file metadata", "metadata", metadata)
+	}
+
+	// create local input file
+	localInputFilePath := p.jobInputFilePath(jobID)
+	if localInputFilePath == "" {
+		err := fmt.Errorf("local input file path is empty")
+		logger.V(logging.ERROR).Error(err, "Local input file path is empty")
+		return err
+	}
+	localInputFile, err := os.OpenFile(localInputFilePath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	if err != nil {
+		logger.V(logging.ERROR).Error(err, "Failed to create local input file", "localInputFilePath", localInputFilePath)
+		return err
+	}
+	defer localInputFile.Close()
+
+	// copy input file stream to local input file
+	writer := bufio.NewWriterSize(localInputFile, 1024*1024)
+
+	// plan writer creation
+	planWriter := newPlanWriter(jobRootDir, p.cfg.MaxOpenFiles)
+	defer func() {
+		// best-effort
+		_ = planWriter.CloseAll()
+	}()
+
+	// model intern tables
+	used := make(map[string]int)           // to prevent duplicate model IDs
+	modelToSafe := make(map[string]string) // to map the model ID to a safe file name
+	seenSafe := make(map[string]struct{})  // to prevent duplicate safe file names
+
+	// streaming loop
+	var offset int64 = 0
+	var lineCount int64 = 0 // to count the number of lines in the input file for logging
+	inputFileReader := bufio.NewReaderSize(reader, 1024*1024)
+
+	for {
+		// context cancel (system-level cancel)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
+		// user cancel
+		if cancelRequested.Load() {
+			logger.V(logging.INFO).Info("preProcess: cancel requested")
+			return ErrCancelled
+		}
+
+		// read the line from the input file
+		line, lineErr := inputFileReader.ReadBytes('\n')
+		if lineErr != nil && lineErr != io.EOF {
+			logger.V(logging.ERROR).Error(lineErr, "Failed to read line from input file")
+			return lineErr
+		}
+		if len(line) == 0 && lineErr == io.EOF {
+			break
+		}
+
+		lineCount++
+
+		// if last line is not terminated with '\n', append '\n' to the line
+		if line[len(line)-1] != '\n' {
+			line = append(line, '\n')
+		}
+
+		// write the line to the input file
+		if _, err := writer.Write(line); err != nil {
+			logger.V(logging.ERROR).Error(err, "Failed to write line to input file", "path", localInputFilePath, "lineCount", lineCount)
+			return err
+		}
+
+		// parse the line (minimal check for the model id) for plan file writing
+		var req planRequestLine
+		trimmedLine := bytes.TrimSuffix(line, []byte{'\n'})
+		if err := json.Unmarshal(trimmedLine, &req); err != nil {
+			logger.V(logging.ERROR).Error(err, "Failed to unmarshal request line", "lineCount", lineCount)
+			return err
+		}
+
+		// get the model id
+		modelID := req.Body.Model
+		if modelID == "" {
+			logger.V(logging.ERROR).Error(fmt.Errorf("model id is empty"), "Model id is empty", "lineCount", lineCount)
+			return fmt.Errorf("model id is empty")
+		}
+
+		// model id interning for safe file name and for preventing conflicts with other model IDs)
+		safeModelID, ok := modelToSafe[modelID]
+		if !ok {
+			safeModelID = internModelID(modelID, used)
+			modelToSafe[modelID] = safeModelID
+		}
+		seenSafe[safeModelID] = struct{}{}
+
+		// plan entry append
+		length := uint32(len(line))
+		if err := planWriter.AppendEntry(safeModelID, planEntry{Offset: offset, Length: length}); err != nil {
+			logger.V(logging.ERROR).Error(err, "Failed to append plan entry", "modelID", modelID, "safeModelID", safeModelID, "offset", offset, "length", length, "lineCount", lineCount)
+			return err
+		}
+		offset += int64(length)
+
+		if lineErr == io.EOF {
+			break
+		}
+	}
+
+	// flush input.jsonl file
+	if err := writer.Flush(); err != nil {
+		logger.V(logging.ERROR).Error(err, "Failed to flush input file", "path", localInputFilePath)
+		return err
+	}
+
+	// finalize the plan files
+	modelIDs := make([]string, 0, len(seenSafe))
+	for id := range seenSafe {
+		modelIDs = append(modelIDs, id)
+	}
+
+	sort.Strings(modelIDs) // to see predictable order of model ids (for debugging)
+
+	if err := planWriter.Finalize(modelIDs); err != nil {
+		logger.V(logging.ERROR).Error(err, "Failed to finalize plan files")
+		return err
+	}
+
+	// model map file writing
+	safeToModel := make(map[string]string, len(modelToSafe))
+	for modelID, safeID := range modelToSafe {
+		safeToModel[safeID] = modelID
+	}
+	modelMapFile := modelMapFile{
+		ModelToSafe: modelToSafe,
+		SafeToModel: safeToModel,
+		LineCount:   lineCount,
+	}
+	if err := writeModelMapFile(jobRootDir, modelMapFile); err != nil {
+		logger.V(logging.ERROR).Error(err, "Failed to write model map file")
+		return err
+	}
+
+	// log info
+	logger.V(logging.INFO).Info("Processor Pre-processing job completed", "inputFilePath", localInputFilePath, "planFilePath", planWriter.plansDir(), "lineCount", lineCount)
+
+	return nil
+}
+
+func (p *Processor) watchCancel(
 	ctx context.Context,
-	line string,
-	resultChan chan *batch_utils.Response,
-	completedRequests *int64,
-	failedRequests *int64,
+	eventWatcher *db.BatchEventsChan,
+	updater *StatusUpdater,
+	jobItem *db.BatchItem,
+	cancelRequested *atomic.Bool,
+	cancellingOnce *sync.Once,
+) {
+	logger := klog.FromContext(ctx)
+	for {
+		select {
+		case <-ctx.Done():
+			logger.V(logging.DEBUG).Info("watchCancel: context done")
+			return
+
+		case event, ok := <-eventWatcher.Events:
+			if !ok {
+				logger.V(logging.DEBUG).Info("watchCancel: event channel closed")
+				return
+			}
+
+			if event.Type == db.BatchEventCancel {
+				logger.V(logging.INFO).Info("watchCancel: cancel event received")
+
+				// signal
+				cancelRequested.Store(true)
+
+				// update status to cancelling
+				cancellingOnce.Do(func() {
+					err := updater.UpdatePersistentStatus(
+						ctx,
+						jobItem,
+						openai.BatchStatusCancelling,
+						nil,
+						nil,
+					)
+					if err != nil {
+						logger.V(logging.ERROR).Error(err, "Failed to update status to cancelling in DB")
+					}
+				})
+			}
+		}
+	}
+}
+
+func (p *Processor) handleCancelled(
+	ctx context.Context,
+	jobItem *db.BatchItem,
+	updater *StatusUpdater,
+	task *db.BatchJobPriority,
 ) error {
 	logger := klog.FromContext(ctx)
 
-	// request parsing
-	var req *batch_utils.Request
-	if err := json.Unmarshal([]byte(line), &req); err != nil {
-		logger.V(logging.ERROR).Error(err, "Failed to unmarshal request line")
-		resultChan <- &batch_utils.Response{
-			ID:       "unknown",
-			CustomID: "unknown",
-			Response: nil,
-			Error: &inference.ClientError{
-				Category: inference.ErrCategoryInvalidReq,
-				Message:  err.Error(),
-				RawError: err,
-			},
+	// 1: cleanup local artifacts (best-effort)
+	jobDir := p.jobRootDir(jobItem.ID)
+	if jobDir != "" {
+		if err := os.RemoveAll(jobDir); err != nil {
+			// keep going: status update is more important than cleanup.
+			logger.V(logging.ERROR).Error(err, "Failed to remove job directory", "path", jobDir)
+		} else {
+			logger.V(logging.INFO).Info("Removed job directory", "path", jobDir)
 		}
-		atomic.AddInt64(failedRequests, 1)
-		return nil
 	}
 
-	// send the request to the inference server
-	resp, err := p.clients.inference.Generate(ctx, &inference.GenerateRequest{})
-
-	// initialize final response
-	finalResp := &batch_utils.Response{
-		CustomID: req.CustomID,
+	// 2: update persistent status -> cancelled
+	if err := updater.UpdatePersistentStatus(ctx, jobItem, openai.BatchStatusCancelled, nil, nil); err != nil {
+		logger.V(logging.ERROR).Error(err, "Failed to update status to cancelled")
+		return err
 	}
 
-	if err != nil {
-		logger.V(logging.ERROR).Error(err, "Failed to send inference request")
-		atomic.AddInt64(failedRequests, 1)
-		finalResp.Error = err
-	} else {
-		logger.V(logging.TRACE).Info("Inference request successful", "customID", req.CustomID, "requestID", resp.RequestID)
-		atomic.AddInt64(completedRequests, 1)
-		finalResp.Response = resp
-
-		// send the response to the result channel
-		resultChan <- finalResp
+	// 3: Delete item from PQ
+	if task != nil {
+		if _, err := p.clients.priorityQueue.PQDelete(ctx, task); err != nil {
+			// best effort: don't fail the whole cancel handling because of PQ delete.
+			// if failed and this item remains in the queue, it's deleted when picked up
+			logger.V(logging.ERROR).Error(err, "Failed to delete cancelled job from Priority Queue")
+		} else {
+			logger.V(logging.INFO).Info("Deleted cancelled job from priority queue")
+		}
 	}
-
-	return nil
-}
-
-func (p *Processor) validateLine(line string) error {
-	// TODO:: validate the request line's method and request body format
-	return nil
-}
-
-func (p *Processor) handleError(ctx context.Context, err error) {
-	// TODO:: error handling.
-	logger := klog.FromContext(ctx)
-	logger.V(logging.ERROR).Error(err, "Inference request failed")
-}
-
-func (p *Processor) handleResponse(ctx context.Context, response *batch_utils.Response) error {
-	// TODO:: response handling + writing line to the output file ...
-	logger := klog.FromContext(ctx)
-	logger.V(logging.DEBUG).Info("Handling response")
+	logger.V(logging.INFO).Info("Job cancelled handled")
 	return nil
 }
 
 // Stop gracefully stops the processor, waiting for all workers to finish.
 func (p *Processor) Stop(ctx context.Context) {
-	logger := klog.FromContext(ctx)
-	p.workerPool.WaitAll()
-	logger.V(logging.INFO).Info("All workers have finished")
+	logger := klog.Background()
+	done := make(chan struct{})
+	go func() {
+		p.wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-ctx.Done():
+		logger.V(logging.INFO).Info("All workers have finished")
+
+	case <-done:
+		logger.V(logging.INFO).Info("Stop timed out or cancelled; giving up waiting for workers")
+	}
 }
