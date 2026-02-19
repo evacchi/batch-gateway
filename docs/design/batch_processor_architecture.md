@@ -216,7 +216,7 @@ jobs/
         ├── <model_id_2>.plan
         └── ...
 ```
--   `input.jsonl` is append-only. Each line is a inference request in json format.
+-   `input.jsonl` is append-only. Each line is an inference request in json format.
 -   `metadata.json` includes information for file name map, and total request line count.
 ```
 {
