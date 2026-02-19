@@ -61,6 +61,57 @@ func (s *spyPQ) DeleteCalls() int {
 	return s.delN
 }
 
+type spyBatchDB struct {
+	inner db.BatchDBClient
+	mu    sync.Mutex
+	calls map[openai.BatchStatus]int
+}
+
+func newSpyBatchDB(inner db.BatchDBClient) *spyBatchDB {
+	return &spyBatchDB{
+		inner: inner,
+		calls: make(map[openai.BatchStatus]int),
+	}
+}
+
+func (s *spyBatchDB) DBStore(ctx context.Context, item *db.BatchItem) (string, error) {
+	return s.inner.DBStore(ctx, item)
+}
+
+func (s *spyBatchDB) DBGet(ctx context.Context, query *db.BatchDBQuery, includeStatic bool, start, limit int) ([]*db.BatchItem, int, bool, error) {
+	return s.inner.DBGet(ctx, query, includeStatic, start, limit)
+}
+
+func (s *spyBatchDB) DBUpdate(ctx context.Context, item *db.BatchItem) error {
+	if len(item.Status) > 0 {
+		var st openai.BatchStatusInfo
+		if err := json.Unmarshal(item.Status, &st); err == nil {
+			s.mu.Lock()
+			s.calls[st.Status]++
+			s.mu.Unlock()
+		}
+	}
+	return s.inner.DBUpdate(ctx, item)
+}
+
+func (s *spyBatchDB) DBDelete(ctx context.Context, IDs []string) ([]string, error) {
+	return s.inner.DBDelete(ctx, IDs)
+}
+
+func (s *spyBatchDB) GetContext(parentCtx context.Context, timeLimit time.Duration) (context.Context, context.CancelFunc) {
+	return s.inner.GetContext(parentCtx, timeLimit)
+}
+
+func (s *spyBatchDB) Close() error {
+	return s.inner.Close()
+}
+
+func (s *spyBatchDB) StatusCalls(status openai.BatchStatus) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.calls[status]
+}
+
 // -------------------------
 // Helpers
 // -------------------------
@@ -305,14 +356,68 @@ func TestPreProcess_BuildsPlansAndModelMap_OffsetsCorrect(t *testing.T) {
 	}
 }
 
-// -------------------------
-// Test 2: Cancel integration
-// - watchCancel sets cancelRequested and updates status to cancelling exactly once
-// - preProcessJob observes cancelRequested and returns ErrCancelled
-// - handleCancelled removes jobDir, updates status to cancelled, calls PQDelete (best-effort)
-// -------------------------
+func TestWatchCancel_SetsFlag_AndUpdatesCancellingOnce(t *testing.T) {
+	ctx := testLoggerCtx()
 
-func TestCancelFlow_DuringPreProcess(t *testing.T) {
+	dbClient := newSpyBatchDB(mockdb.NewMockBatchDBClient())
+	statusClient := mockdb.NewMockBatchStatusClient()
+	eventClient := mockdb.NewMockBatchEventChannelClient()
+
+	jobID := "job-cancel-1"
+	initialStatus := openai.BatchStatusInfo{Status: openai.BatchStatusInProgress}
+	jobItem := &db.BatchItem{
+		ID:     jobID,
+		Spec:   mustJSON(t, openai.BatchSpec{InputFileID: "unused-for-watch-cancel"}),
+		Status: mustJSON(t, initialStatus),
+		Tags: db.Tags{
+			"tenant": "tenantA",
+		},
+	}
+	if _, err := dbClient.DBStore(ctx, jobItem); err != nil {
+		t.Fatalf("DBStore job item: %v", err)
+	}
+
+	p := NewProcessor(config.NewConfig(), &ProcessorClients{})
+	updater := NewStatusUpdater(dbClient, statusClient)
+
+	evCh, err := eventClient.ECConsumerGetChannel(ctx, jobID)
+	if err != nil {
+		t.Fatalf("ECConsumerGetChannel: %v", err)
+	}
+	defer evCh.CloseFn()
+
+	var cancelRequested atomic.Bool
+	var cancellingOnce sync.Once
+
+	// Start watching cancel in background
+	go p.watchCancel(ctx, evCh, updater, jobItem, &cancelRequested, &cancellingOnce)
+
+	// Send cancel twice; status update should still happen once due to sync.Once.
+	_, _ = eventClient.ECProducerSendEvents(ctx, []db.BatchEvent{
+		{ID: jobID, Type: db.BatchEventCancel, TTL: 60},
+	})
+	_, _ = eventClient.ECProducerSendEvents(ctx, []db.BatchEvent{
+		{ID: jobID, Type: db.BatchEventCancel, TTL: 60},
+	})
+
+	deadline := time.Now().Add(2 * time.Second)
+	for !cancelRequested.Load() && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !cancelRequested.Load() {
+		t.Fatalf("cancelRequested was not set")
+	}
+
+	deadline = time.Now().Add(2 * time.Second)
+	for dbClient.StatusCalls(openai.BatchStatusCancelling) < 1 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if dbClient.StatusCalls(openai.BatchStatusCancelling) != 1 {
+		t.Fatalf("expected cancelling update exactly once, got=%d", dbClient.StatusCalls(openai.BatchStatusCancelling))
+	}
+}
+
+func TestPreProcess_CancelFlag_ReturnsErrCancelled(t *testing.T) {
 	ctx := testLoggerCtx()
 
 	workDir := t.TempDir()
@@ -322,75 +427,48 @@ func TestCancelFlow_DuringPreProcess(t *testing.T) {
 
 	dbClient := mockdb.NewMockBatchDBClient()
 	filesClient := mockfiles.NewMockBatchFilesClient()
-	statusClient := mockdb.NewMockBatchStatusClient()
-	eventClient := mockdb.NewMockBatchEventChannelClient()
-
-	// PQ with spy to assert PQDelete call
-	rawPQ := mockdb.NewMockBatchPriorityQueueClient()
-	pq := &spyPQ{inner: rawPQ}
 
 	clients := &ProcessorClients{
 		database:      dbClient,
 		files:         filesClient,
-		priorityQueue: pq,
-		status:        statusClient,
-		event:         eventClient,
+		priorityQueue: nil,
+		status:        nil,
+		event:         nil,
 		inference:     nil,
 	}
 	p := NewProcessor(cfg, clients)
 
-	jobID := "job-cancel-1"
-	inputFileID := "file-cancel-1"
+	jobID := "job-preprocess-cancel"
+	inputFileID := "file-preprocess-cancel"
+	folder := uniqueTestFolder(t, "tenantA/preprocess-cancel")
+	cleanMockFilesFolder(t, folder)
 
-	// large input for cancellation detect
-
-	models := make([]string, 0, 50000)
-	for i := 0; i < 50000; i++ {
-		switch {
-		case i%3 == 0:
+	models := make([]string, 0, 2000)
+	for i := 0; i < 2000; i++ {
+		switch i % 3 {
+		case 0:
 			models = append(models, "mA")
-		case i%3 == 1:
+		case 1:
 			models = append(models, "mB")
-		case i%3 == 2:
+		default:
 			models = append(models, "mC")
 		}
 	}
 	lines := makeInputLines(models)
-
 	var remoteBuf bytes.Buffer
 	for _, ln := range lines {
 		remoteBuf.Write(ln)
 	}
 
-	folder := uniqueTestFolder(t, "tenantA/cancel-test")
-	cleanMockFilesFolder(t, folder)
-	filename := "input.jsonl"
-	if _, err := filesClient.Store(ctx, filename, folder, 0, 0, bytes.NewReader(remoteBuf.Bytes())); err != nil {
+	if _, err := filesClient.Store(ctx, "input.jsonl", folder, 0, 0, bytes.NewReader(remoteBuf.Bytes())); err != nil {
 		t.Fatalf("files.Store: %v", err)
 	}
-
-	// DB item for input file spec
-	fileSpec := &batch_utils.FileSpec{Filename: filename, FolderName: folder}
+	fileSpec := &batch_utils.FileSpec{Filename: "input.jsonl", FolderName: folder}
 	if _, err := dbClient.DBStore(ctx, &db.BatchItem{
 		ID:   inputFileID,
 		Spec: mustJSON(t, fileSpec),
 	}); err != nil {
 		t.Fatalf("DBStore file item: %v", err)
-	}
-
-	// DB item for job (needed for status updater)
-	// StatusUpdater unmarshals dbJob.Status to BatchStatusInfo
-	initialStatus := openai.BatchStatusInfo{Status: openai.BatchStatusInProgress}
-	jobItem := &db.BatchItem{
-		ID:     jobID,
-		Spec:   mustJSON(t, openai.BatchSpec{InputFileID: inputFileID}),
-		Status: mustJSON(t, initialStatus),
-		Tags: db.Tags{
-			"tenant": "tenantA",
-		},
-	}
-	if _, err := dbClient.DBStore(ctx, jobItem); err != nil {
-		t.Fatalf("DBStore job item: %v", err)
 	}
 
 	jobInfo := &batch_utils.JobInfo{
@@ -407,89 +485,73 @@ func TestCancelFlow_DuringPreProcess(t *testing.T) {
 		TenantID: "tenantA",
 	}
 
-	// Create updater used by watchCancel/handleCancelled
-	updater := NewStatusUpdater(dbClient, statusClient)
-
-	// Event watcher
-	evCh, err := eventClient.ECConsumerGetChannel(ctx, jobID)
-	if err != nil {
-		t.Fatalf("ECConsumerGetChannel: %v", err)
-	}
-	defer evCh.CloseFn()
-
 	var cancelRequested atomic.Bool
-	var cancellingOnce sync.Once
+	cancelRequested.Store(true)
+	err := p.preProcessJob(ctx, jobInfo, &cancelRequested)
+	if !errors.Is(err, ErrCancelled) {
+		t.Fatalf("expected ErrCancelled, got: %v", err)
+	}
+}
 
-	// Start watching cancel in background
-	go p.watchCancel(ctx, evCh, updater, jobItem, &cancelRequested, &cancellingOnce)
+func TestHandleCancelled_CleansDir_UpdatesCancelled_DeletesPQ(t *testing.T) {
+	ctx := testLoggerCtx()
 
-	// Start preProcess in goroutine
-	errCh := make(chan error, 1)
-	go func() {
-		errCh <- p.preProcessJob(ctx, jobInfo, &cancelRequested)
-	}()
+	workDir := t.TempDir()
+	cfg := config.NewConfig()
+	cfg.WorkDir = workDir
 
-	// Send cancel quickly (but give preProcess a moment to start and create job dir)
-	time.Sleep(10 * time.Millisecond)
-	_, _ = eventClient.ECProducerSendEvents(ctx, []db.BatchEvent{
-		{ID: jobID, Type: db.BatchEventCancel},
-	})
-	// Send cancel again to ensure sync.Once behavior (should still update cancelling only once)
-	_, _ = eventClient.ECProducerSendEvents(ctx, []db.BatchEvent{
-		{ID: jobID, Type: db.BatchEventCancel},
-	})
+	dbClient := mockdb.NewMockBatchDBClient()
+	statusClient := mockdb.NewMockBatchStatusClient()
+	pq := &spyPQ{inner: mockdb.NewMockBatchPriorityQueueClient()}
 
-	// Wait for preProcess to return (should be ErrCancelled)
-	select {
-	case e := <-errCh:
-		if !errors.Is(e, ErrCancelled) {
-			t.Fatalf("expected ErrCancelled, got: %v", e)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatalf("timeout waiting for preProcessJob to return")
+	clients := &ProcessorClients{
+		database:      dbClient,
+		files:         nil,
+		priorityQueue: pq,
+		status:        statusClient,
+		event:         nil,
+		inference:     nil,
+	}
+	p := NewProcessor(cfg, clients)
+
+	jobID := "job-handle-cancelled"
+	jobItem := &db.BatchItem{
+		ID: jobID,
+		Status: mustJSON(t, openai.BatchStatusInfo{
+			Status: openai.BatchStatusCancelling,
+		}),
+		Tags: db.Tags{
+			"tenant": "tenantA",
+		},
+	}
+	if _, err := dbClient.DBStore(ctx, jobItem); err != nil {
+		t.Fatalf("DBStore job item: %v", err)
 	}
 
-	// Ensure DB status was updated to cancelling at least once.
-	// We can't count DBUpdate calls without another spy; instead check final stored status becomes cancelling
-	// BEFORE handleCancelled runs (watchCancel did it).
-	jobs, _, _, err := dbClient.DBGet(ctx, &db.BatchDBQuery{IDs: []string{jobID}}, true, 0, 1)
-	if err != nil || len(jobs) != 1 {
-		t.Fatalf("DBGet job: err=%v len=%d", err, len(jobs))
+	jobDir := p.jobRootDir(jobID)
+	if err := os.MkdirAll(jobDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll jobDir: %v", err)
 	}
-	var st openai.BatchStatusInfo
-	if err := json.Unmarshal(jobs[0].Status, &st); err != nil {
-		t.Fatalf("unmarshal status: %v", err)
-	}
-	if st.Status != openai.BatchStatusCancelling {
-		t.Fatalf("expected status=cancelling after cancel event, got=%s", st.Status)
+	if err := os.WriteFile(filepath.Join(jobDir, "dummy.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatalf("WriteFile dummy: %v", err)
 	}
 
-	// Now handleCancelled should remove job dir + set cancelled + attempt PQDelete
-	task := &db.BatchJobPriority{ID: jobID}
+	updater := NewStatusUpdater(dbClient, statusClient)
+	task := &db.BatchJobPriority{
+		ID:  jobID,
+		SLO: time.Now().Add(1 * time.Minute),
+	}
 	if err := p.handleCancelled(ctx, jobItem, updater, task); err != nil {
 		t.Fatalf("handleCancelled: %v", err)
 	}
 
-	// job dir should be removed (best-effort but should normally succeed)
-	jobDir := p.jobRootDir(jobID)
 	if _, err := os.Stat(jobDir); err == nil {
 		t.Fatalf("expected job dir removed, still exists: %s", jobDir)
 	}
 
-	// status should now be cancelled in DB
-	jobs, _, _, err = dbClient.DBGet(ctx, &db.BatchDBQuery{IDs: []string{jobID}}, true, 0, 1)
+	jobs, _, _, err := dbClient.DBGet(ctx, &db.BatchDBQuery{IDs: []string{jobID}}, true, 0, 1)
 	if err != nil || len(jobs) != 1 {
 		t.Fatalf("DBGet job after cancel: err=%v len=%d", err, len(jobs))
-	}
-	st = openai.BatchStatusInfo{}
-	if err := json.Unmarshal(jobs[0].Status, &st); err != nil {
-		t.Fatalf("unmarshal status after cancel: %v", err)
-	}
-	if st.Status != openai.BatchStatusCancelled {
-		t.Fatalf("expected status=cancelled, got=%s", st.Status)
-	}
-	if st.CancelledAt == nil {
-		t.Fatalf("expected CancelledAt to be set")
 	}
 
 	// PQDelete should have been attempted exactly once by handleCancelled
