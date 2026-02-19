@@ -254,7 +254,7 @@ func waitObservabilityFatalError(obsFatalCh <-chan error, wait time.Duration) er
 func buildProcessorClients(ctx context.Context, cfg *config.ProcessorConfig) (worker.ProcessorClients, error) {
 	logger := klog.FromContext(ctx)
 
-	// TODO::: remove mock clients and replace with actual clients + logging update
+	// TODO: remove mock clients and replace with actual clients + logging update
 	logger.V(logging.INFO).Info("Building processor clients with mock clients for now", "inferenceConfig", cfg.InferenceConfig)
 
 	// Initialize inference client with configuration

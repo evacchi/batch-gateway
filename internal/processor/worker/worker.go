@@ -113,7 +113,7 @@ func (p *Processor) release() {
 	}
 }
 
-// TODO:: need to add detailed validation here for each client.
+// TODO: need to add detailed validation here for each client.
 func (pc *ProcessorClients) Validate() error {
 	if pc.database == nil {
 		return fmt.Errorf("database client is missing")

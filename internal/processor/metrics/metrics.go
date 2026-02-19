@@ -85,7 +85,7 @@ var (
 )
 
 func InitMetrics(cfg config.ProcessorConfig) error {
-	// number of jobs processed : TODO:: add tenantID?
+	// number of jobs processed
 	jobsProcessed = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "jobs_processed_total",
