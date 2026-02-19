@@ -27,7 +27,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/llm-d-incubation/batch-gateway/internal/apiserver/common"
 	"github.com/llm-d-incubation/batch-gateway/internal/database/api"
-	"github.com/llm-d-incubation/batch-gateway/internal/shared/batch_utils"
+	batch_types "github.com/llm-d-incubation/batch-gateway/internal/shared/types"
 	"github.com/llm-d-incubation/batch-gateway/internal/shared/openai"
 	"github.com/llm-d-incubation/batch-gateway/internal/util/logging"
 )
@@ -188,7 +188,7 @@ func (c *BatchApiHandler) CreateBatch(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// enqueue job
-	bjpData := &batch_utils.BatchJobPriorityData{
+	bjpData := &batch_types.BatchJobPriorityData{
 		CreatedAt: createdAt,
 	}
 	bjpDataBytes, err := json.Marshal(bjpData)

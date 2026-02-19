@@ -24,7 +24,7 @@ import (
 
 	db "github.com/llm-d-incubation/batch-gateway/internal/database/api"
 	filesapi "github.com/llm-d-incubation/batch-gateway/internal/files_store/api"
-	"github.com/llm-d-incubation/batch-gateway/internal/shared/batch_utils"
+	batch_types "github.com/llm-d-incubation/batch-gateway/internal/shared/types"
 )
 
 func (p *Processor) jobRootDir(jobID string) string {
@@ -46,7 +46,7 @@ func (p *Processor) openInputFileStream(ctx context.Context, inputFileID string)
 	}
 
 	fileItem := items[0]
-	fileSpec := &batch_utils.FileSpec{}
+	fileSpec := &batch_types.FileSpec{}
 	if err := json.Unmarshal(fileItem.Spec, fileSpec); err != nil {
 		return nil, nil, fmt.Errorf("failed to unmarshal file spec: %w", err)
 	}

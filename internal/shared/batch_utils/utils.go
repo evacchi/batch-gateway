@@ -25,6 +25,7 @@ import (
 
 	db "github.com/llm-d-incubation/batch-gateway/internal/database/api"
 	"github.com/llm-d-incubation/batch-gateway/internal/shared/openai"
+	batch_types "github.com/llm-d-incubation/batch-gateway/internal/shared/types"
 )
 
 // FromDBItemToBatchJobObject: convert db item to openai compatible batch job object
@@ -45,8 +46,8 @@ func FromDBItemToBatchJobObject(job *db.BatchItem) (*openai.Batch, error) {
 }
 
 // FromDBItemToJobInfoObject: convert db item to Processor's JobInfo object
-func FromDBItemToJobInfoObject(job *db.BatchItem) (*JobInfo, error) {
-	jobInfo := &JobInfo{
+func FromDBItemToJobInfoObject(job *db.BatchItem) (*batch_types.JobInfo, error) {
+	jobInfo := &batch_types.JobInfo{
 		JobID:    job.ID,
 		BatchJob: &openai.Batch{},
 	}
@@ -121,8 +122,8 @@ func BuildUpdatedStatusInfo(
 	return &updated, nil
 }
 
-func GetJobPriorityDataFromQueueItem(item *db.BatchJobPriority) (*BatchJobPriorityData, error) {
-	data := &BatchJobPriorityData{}
+func GetJobPriorityDataFromQueueItem(item *db.BatchJobPriority) (*batch_types.BatchJobPriorityData, error) {
+	data := &batch_types.BatchJobPriorityData{}
 	if err := json.Unmarshal(item.Data, data); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal job priority data: %w", err)
 	}

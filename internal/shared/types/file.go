@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package batch_utils
+package batch_types
 
 import "github.com/llm-d-incubation/batch-gateway/internal/shared/openai"
 

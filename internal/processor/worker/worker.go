@@ -40,6 +40,7 @@ import (
 	"github.com/llm-d-incubation/batch-gateway/internal/processor/metrics"
 	"github.com/llm-d-incubation/batch-gateway/internal/shared/batch_utils"
 	"github.com/llm-d-incubation/batch-gateway/internal/shared/openai"
+	batch_types "github.com/llm-d-incubation/batch-gateway/internal/shared/types"
 	"github.com/llm-d-incubation/batch-gateway/internal/util/logging"
 )
 
@@ -272,7 +273,7 @@ func (p *Processor) RunPollingLoop(ctx context.Context) error {
 
 		// process job
 		p.wg.Add(1)
-		go func(c context.Context, jobItem *db.BatchItem, jobInfo *batch_utils.JobInfo, task *db.BatchJobPriority) {
+		go func(c context.Context, jobItem *db.BatchItem, jobInfo *batch_types.JobInfo, task *db.BatchJobPriority) {
 			defer p.wg.Done()
 			defer p.release()
 			defer func() {
@@ -354,7 +355,7 @@ func (p *Processor) RunPollingLoop(ctx context.Context) error {
 // creates the plan per model, while saving the input file in the work folder.
 // temp plan file is saved in the work folder's subfolder while creating the plan (jobs/<jobid>/plans/<modelid>.plan.tmp)
 // then the temp plan file is renamed to the final plan file (jobs/<jobid>/plans/<modelid>.plan)
-func (p *Processor) preProcessJob(ctx context.Context, jobInfo *batch_utils.JobInfo, cancelRequested *atomic.Bool) error {
+func (p *Processor) preProcessJob(ctx context.Context, jobInfo *batch_types.JobInfo, cancelRequested *atomic.Bool) error {
 	logger := klog.FromContext(ctx)
 	logger.V(logging.INFO).Info("Pre-processing job") // job id is in the logger already
 	jobID := jobInfo.JobID

@@ -22,8 +22,8 @@ import (
 	mockdb "github.com/llm-d-incubation/batch-gateway/internal/database/mock"
 	mockfiles "github.com/llm-d-incubation/batch-gateway/internal/files_store/mock"
 	"github.com/llm-d-incubation/batch-gateway/internal/processor/config"
-	"github.com/llm-d-incubation/batch-gateway/internal/shared/batch_utils"
 	"github.com/llm-d-incubation/batch-gateway/internal/shared/openai"
+	batch_types "github.com/llm-d-incubation/batch-gateway/internal/shared/types"
 )
 
 const mockFilesRootDir = "/tmp/batch-gateway-files"
@@ -243,7 +243,7 @@ func TestPreProcess_BuildsPlansAndModelMap_OffsetsCorrect(t *testing.T) {
 
 	// Create DB item for "input file metadata"
 	inputFileID := "file-123"
-	fileSpec := &batch_utils.FileSpec{Filename: filename, FolderName: folder}
+	fileSpec := &batch_types.FileSpec{Filename: filename, FolderName: folder}
 	fileItem := &db.BatchItem{
 		ID:   inputFileID,
 		Spec: mustJSON(t, fileSpec),
@@ -265,7 +265,7 @@ func TestPreProcess_BuildsPlansAndModelMap_OffsetsCorrect(t *testing.T) {
 
 	// Build JobInfo (only BatchSpec.InputFileID is used in preProcessJob)
 	jobID := "job-abc"
-	jobInfo := &batch_utils.JobInfo{
+	jobInfo := &batch_types.JobInfo{
 		JobID: jobID,
 		BatchJob: &openai.Batch{
 			ID: jobID,
@@ -463,7 +463,7 @@ func TestPreProcess_CancelFlag_ReturnsErrCancelled(t *testing.T) {
 	if _, err := filesClient.Store(ctx, "input.jsonl", folder, 0, 0, bytes.NewReader(remoteBuf.Bytes())); err != nil {
 		t.Fatalf("files.Store: %v", err)
 	}
-	fileSpec := &batch_utils.FileSpec{Filename: "input.jsonl", FolderName: folder}
+	fileSpec := &batch_types.FileSpec{Filename: "input.jsonl", FolderName: folder}
 	if _, err := dbClient.DBStore(ctx, &db.BatchItem{
 		ID:   inputFileID,
 		Spec: mustJSON(t, fileSpec),
@@ -471,7 +471,7 @@ func TestPreProcess_CancelFlag_ReturnsErrCancelled(t *testing.T) {
 		t.Fatalf("DBStore file item: %v", err)
 	}
 
-	jobInfo := &batch_utils.JobInfo{
+	jobInfo := &batch_types.JobInfo{
 		JobID: jobID,
 		BatchJob: &openai.Batch{
 			ID: jobID,

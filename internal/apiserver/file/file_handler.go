@@ -31,8 +31,8 @@ import (
 	"github.com/llm-d-incubation/batch-gateway/internal/apiserver/common"
 	dbapi "github.com/llm-d-incubation/batch-gateway/internal/database/api"
 	fsapi "github.com/llm-d-incubation/batch-gateway/internal/files_store/api"
-	"github.com/llm-d-incubation/batch-gateway/internal/shared/batch_utils"
 	"github.com/llm-d-incubation/batch-gateway/internal/shared/openai"
+	batch_types "github.com/llm-d-incubation/batch-gateway/internal/shared/types"
 	"github.com/llm-d-incubation/batch-gateway/internal/util/logging"
 )
 
@@ -86,12 +86,12 @@ func (c *FileApiHandler) GetRoutes() []common.Route {
 
 // itemToFileObject deserializes a BatchItem's Spec and Status fields into a FileObject.
 func (c *FileApiHandler) dbItemToFileObject(item *dbapi.BatchItem) (*openai.FileObject, error) {
-	fileSpec := &batch_utils.FileSpec{}
+	fileSpec := &batch_types.FileSpec{}
 	if err := json.Unmarshal(item.Spec, fileSpec); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal file spec: %w", err)
 	}
 
-	fileStatus := &batch_utils.FileStatusInfo{}
+	fileStatus := &batch_types.FileStatusInfo{}
 	if err := json.Unmarshal(item.Status, fileStatus); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal file status: %w", err)
 	}
@@ -319,7 +319,7 @@ func (c *FileApiHandler) CreateFile(w http.ResponseWriter, r *http.Request) {
 	}()
 
 	// Construct file spec
-	fileSpec := batch_utils.FileSpec{
+	fileSpec := batch_types.FileSpec{
 		Bytes:       fileMeta.Size,
 		CreatedAt:   createdAt,
 		ExpiresAt:   expiresAt,
@@ -337,7 +337,7 @@ func (c *FileApiHandler) CreateFile(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Construct file status
-	fileStatus := batch_utils.FileStatusInfo{
+	fileStatus := batch_types.FileStatusInfo{
 		Status:        openai.FileObjectStatusUploaded,
 		StatusDetails: "",
 	}
@@ -560,7 +560,7 @@ func (c *FileApiHandler) DownloadFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	fileSpec := &batch_utils.FileSpec{}
+	fileSpec := &batch_types.FileSpec{}
 	if err := json.Unmarshal(item.Spec, fileSpec); err != nil {
 		logger.Error(err, "failed to unmarshal file spec")
 		common.WriteInternalServerError(w, r)
@@ -603,7 +603,7 @@ func (c *FileApiHandler) DeleteFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	fileSpec := &batch_utils.FileSpec{}
+	fileSpec := &batch_types.FileSpec{}
 	if err := json.Unmarshal(item.Spec, fileSpec); err != nil {
 		logger.Error(err, "failed to unmarshal file spec")
 		common.WriteInternalServerError(w, r)
