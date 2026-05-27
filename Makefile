@@ -1,4 +1,4 @@
-.PHONY: help build build-apiserver build-processor build-gc run-apiserver run-processor run-gc run-apiserver-dev run-processor-dev run-gc-dev build-release package-release publish-helm-chart generate-release test test-coverage test-coverage-func clean lint fmt vet tidy install-tools deps-get deps-verify bench check check-container-tool ci image-build image-build-apiserver image-build-processor image-build-gc test-integration test-all test-e2e test-helm dev-deploy dev-clean dev-rm-cluster pre-commit
+.PHONY: help build build-apiserver build-processor build-gc run-apiserver run-processor run-gc run-apiserver-dev run-processor-dev run-gc-dev build-release package-release publish-helm-chart generate-release test test-coverage test-coverage-func clean lint fmt vet tidy install-tools deps-get deps-verify bench check check-container-tool ci image-build image-build-apiserver image-build-processor image-build-gc test-integration test-all test-e2e test-e2e-dispatcher test-helm dev-deploy dev-deploy-dispatcher dev-clean dev-rm-cluster pre-commit
 
 SHELL := /usr/bin/env bash
 
@@ -330,6 +330,10 @@ dev-deploy:
 dev-deploy-gie:
 	@ENABLE_GIE=true bash scripts/dev-deploy.sh
 
+## dev-deploy-dispatcher: Deploy the llm-d-async dispatcher into the dev Kind cluster (requires dev-deploy first)
+dev-deploy-dispatcher:
+	@bash scripts/dev-deploy-dispatcher.sh
+
 ## dev-clean: Clean up dev deployment (removes all resources but keeps the kind cluster)
 dev-clean:
 	@bash scripts/dev-clean.sh
@@ -363,3 +367,8 @@ test-e2e:
 	fi; \
 	rm -f $$OUT; \
 	exit $$TEST_EXIT
+
+## test-e2e-dispatcher: Run dispatcher E2E tests (requires dev-deploy + dev-deploy-dispatcher)
+test-e2e-dispatcher:
+	@echo "Running dispatcher E2E tests..."
+	cd test/e2e && $(GO) test -v -count=1 -run TestDispatcher ./...
