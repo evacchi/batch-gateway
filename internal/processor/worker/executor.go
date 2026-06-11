@@ -643,9 +643,8 @@ func (p *Processor) processModelAsync(
 
 	// ── Phase 2: Collect ───────────────────────────────────────────────────
 	var modelErr error
-	collected := 0
 
-	for collected < len(pending) {
+	for len(pending) > 0 {
 		resp, err := asyncClient.GetResult(requestAbortCtx)
 		if err != nil {
 			break
@@ -662,7 +661,6 @@ func (p *Processor) processModelAsync(
 			modelErr = err
 		}
 		delete(pending, resp.RequestID)
-		collected++
 	}
 
 	// Drain submitted-but-uncollected requests as errors so that
