@@ -1,22 +1,26 @@
 # Benchmark: Batch vs Live Traffic Isolation
 
-Measure whether batch requests degrade live (interactive) traffic quality
-when routed through the async dispatcher with a dispatch budget gate.
+Measure whether batch requests degrade live (interactive) traffic quality,
+and how routing through the async dispatcher with a dispatch budget gate helps.
 
 The benchmark runs [guidellm](https://github.com/vllm-project/guidellm) in
 **sweep mode** against the inference gateway to produce a latency/throughput
-saturation curve across three scenarios:
+saturation curve across four scenarios:
 
-| Scenario | guidellm load | Batch load | Gate |
+| Scenario | Dispatch mode | Batch load | Gate |
 |----------|--------------|------------|------|
-| **baseline** | sweep | none | n/a |
-| **gated** | sweep | 100 requests | prometheus-budget |
-| **ungated** | sweep | 100 requests | constant (always open) |
+| **baseline** | n/a | none | n/a |
+| **sync** | sync (direct) | 100 requests | none |
+| **gated** | async | 100 requests | prometheus-budget |
+| **ungated** | async | 100 requests | constant (always open) |
 
-**Expected outcome:** The **gated** scenario should produce metrics close to
-**baseline** — the dispatch budget gate throttles batch requests when the
-inference endpoint is under live load. The **ungated** scenario should show
-degradation, confirming the gate's protective effect.
+**Expected outcome:**
+- **sync** shows degradation vs **baseline** — batch requests compete directly
+  with live traffic for inference capacity with no gating mechanism
+- **gated** should produce metrics close to **baseline** — the dispatch budget
+  gate throttles batch requests when the inference endpoint is under live load
+- **ungated** should show degradation similar to **sync** — async dispatch
+  without a gate provides no protection
 
 ## Prerequisites
 
@@ -68,7 +72,7 @@ kubectl apply -n ${NAMESPACE} -f ${BATCH_REPO}/test/e2e/benchmark/results-pvc.ya
 
 ## Step 3: Run the benchmark
 
-The benchmark script orchestrates three scenarios sequentially:
+The benchmark script orchestrates four scenarios sequentially:
 
 ```bash
 cd ${BATCH_REPO}
@@ -78,6 +82,8 @@ cd ${BATCH_REPO}
     --results-dir ./benchmark-results \
     --batch-size 100 \
     --max-seconds 120 \
+    --batch-release batch-gateway \
+    --batch-chart ${BATCH_REPO}/charts/batch-gateway/ \
     --async-release async-processor \
     --async-chart ${ASYNC_REPO}/charts/async-processor/ \
     --async-values ${ASYNC_REPO}/docs/guides/e2e-deploy/async-processor-values.yaml
@@ -89,20 +95,24 @@ cd ${BATCH_REPO}
 | `--results-dir` | `./benchmark-results` | Local directory for collected results |
 | `--batch-size` | `100` | Number of requests in the batch workload |
 | `--max-seconds` | `120` | guidellm sweep duration per scenario |
+| `--batch-release` | `batch-gateway` | Helm release name of the batch-gateway |
+| `--batch-chart` | — | Path to batch-gateway Helm chart (required for sync scenario) |
 | `--async-release` | `async-processor` | Helm release name of the async-processor |
 | `--async-chart` | — | Path to async-processor Helm chart (required for ungated scenario) |
 | `--async-values` | — | Path to async-processor values file (required for ungated scenario) |
 
 The script will:
 1. Run guidellm sweep with no batch load (**baseline**)
-2. Submit a batch through the batch-gateway API, then run guidellm sweep (**gated**)
-3. Reconfigure the dispatcher gate to `constant` (always open), submit a batch,
-   then run guidellm sweep (**ungated**)
-4. Restore the original gate configuration
-5. Print a summary of collected results
+2. Switch processor to sync mode, submit a batch, run guidellm sweep (**sync**)
+3. Switch processor back to async mode, submit a batch, run guidellm sweep (**gated**)
+4. Reconfigure the dispatcher gate to `constant` (always open), submit a batch,
+   run guidellm sweep (**ungated**)
+5. Restore the original gate configuration
+6. Print a summary of collected results
 
-If `--async-chart` and `--async-values` are not provided, the ungated scenario
-is skipped.
+The **sync** scenario requires `--batch-chart`. The **ungated** scenario
+requires `--async-chart` and `--async-values`. Missing flags cause the
+respective scenario to be skipped.
 
 ## Step 4: Interpret results
 
@@ -120,10 +130,12 @@ Key metrics to compare across scenarios:
 | `output_tokens_per_second` | Token generation throughput |
 
 Look at the sweep curve inflection point across scenarios:
-- If the **gated** curve matches **baseline**, the gate is working — batch
-  requests back off when the endpoint is saturated
-- If the **ungated** curve degrades earlier than **baseline**, batch requests
-  are competing with live traffic for inference capacity
+- **sync** vs **baseline**: shows the cost of uncontrolled batch traffic
+  competing directly with live requests for inference capacity
+- **gated** vs **baseline**: if the curves match, the dispatch budget gate is
+  working — batch requests back off when the endpoint is saturated
+- **ungated** vs **baseline**: shows that async dispatch alone (without a gate)
+  does not protect live traffic — degradation should be similar to **sync**
 
 ## Running individual scenarios
 

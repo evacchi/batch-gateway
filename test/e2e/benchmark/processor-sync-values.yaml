@@ -1,0 +1,6 @@
+processor:
+  config:
+    dispatchMode: sync
+    modelGateways:
+      Qwen/Qwen3-0.6B:
+        url: "http://llm-d-inference-gateway-istio:80"

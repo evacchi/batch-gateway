@@ -1,18 +1,19 @@
 #!/usr/bin/env bash
 # Benchmark: Batch vs Live Traffic Isolation
 #
-# Runs three guidellm sweep scenarios to measure whether batch requests
-# degrade live traffic quality when the dispatcher gate is active.
+# Runs four guidellm sweep scenarios to measure whether batch requests
+# degrade live traffic quality, and how the dispatcher gate helps.
 #
 # Scenarios:
 #   1. baseline — guidellm sweep only, no batch load
-#   2. gated   — guidellm sweep + batch load, dispatcher gate enabled
-#   3. ungated — guidellm sweep + batch load, dispatcher gate disabled (constant)
+#   2. sync    — guidellm sweep + batch load, processor in sync mode (no dispatcher)
+#   3. gated   — guidellm sweep + batch load, async dispatch + prometheus-budget gate
+#   4. ungated — guidellm sweep + batch load, async dispatch + constant gate (always open)
 #
 # Prerequisites:
 #   - Kubernetes cluster with the llm-d stack deployed (see docs/guides/benchmark.md)
 #   - async-processor deployed with prometheus-budget gate
-#   - batch-gateway configured for async dispatch
+#   - batch-gateway deployed
 #
 # Usage:
 #   ./benchmark.sh [--namespace <ns>] [--results-dir <dir>] [--batch-size <n>]
@@ -27,6 +28,8 @@ NAMESPACE="${NAMESPACE:-llm-d-async}"
 RESULTS_DIR="${RESULTS_DIR:-./benchmark-results}"
 BATCH_SIZE="${BATCH_SIZE:-100}"
 GUIDELLM_MAX_SECONDS="${GUIDELLM_MAX_SECONDS:-120}"
+BATCH_RELEASE="${BATCH_RELEASE:-batch-gateway}"
+BATCH_CHART="${BATCH_CHART:-}"
 ASYNC_RELEASE="${ASYNC_RELEASE:-async-processor}"
 ASYNC_CHART="${ASYNC_CHART:-}"
 ASYNC_VALUES="${ASYNC_VALUES:-}"
@@ -38,6 +41,8 @@ while [[ $# -gt 0 ]]; do
         --results-dir)   RESULTS_DIR="$2"; shift 2 ;;
         --batch-size)    BATCH_SIZE="$2"; shift 2 ;;
         --max-seconds)   GUIDELLM_MAX_SECONDS="$2"; shift 2 ;;
+        --batch-release) BATCH_RELEASE="$2"; shift 2 ;;
+        --batch-chart)   BATCH_CHART="$2"; shift 2 ;;
         --async-release) ASYNC_RELEASE="$2"; shift 2 ;;
         --async-chart)   ASYNC_CHART="$2"; shift 2 ;;
         --async-values)  ASYNC_VALUES="$2"; shift 2 ;;
@@ -129,6 +134,24 @@ run_batch_submit() {
     apply_with_env "${SCRIPT_DIR}/batch-submit.yaml"
 }
 
+switch_processor_mode() {
+    local mode="$1"
+    local values_file="${SCRIPT_DIR}/processor-${mode}-values.yaml"
+
+    if [ -z "${BATCH_CHART}" ]; then
+        log "Skipping processor mode switch: --batch-chart required"
+        return 1
+    fi
+
+    log "Switching processor to ${mode} dispatch mode"
+    helm upgrade "${BATCH_RELEASE}" "${BATCH_CHART}" \
+        -f "${values_file}" \
+        -n "${NAMESPACE}" --reuse-values
+
+    kubectl rollout restart deployment -l "app.kubernetes.io/component=processor" -n "${NAMESPACE}"
+    kubectl rollout status deployment -l "app.kubernetes.io/component=processor" -n "${NAMESPACE}" --timeout=120s
+}
+
 # ── Ensure PVC exists ─────────────────────────────────────────────────
 
 ensure_pvc() {
@@ -145,10 +168,32 @@ run_baseline() {
     run_guidellm_sweep "baseline"
 }
 
-# ── Scenario 2: Gated (batch + dispatcher gate enabled) ──────────────
+# ── Scenario 2: Sync (batch + no dispatcher) ─────────────────────────
+
+run_sync() {
+    log "━━━ Scenario 2: SYNC (batch load + sync dispatch, no dispatcher) ━━━"
+
+    if ! switch_processor_mode "sync"; then
+        log "Skipping sync scenario"
+        return 0
+    fi
+
+    run_batch_submit
+    sleep 10
+
+    run_guidellm_sweep "sync"
+
+    wait_for_job "batch-submit" 600 || true
+    cleanup_job "batch-submit"
+
+    # Switch back to async for the remaining scenarios
+    switch_processor_mode "async"
+}
+
+# ── Scenario 3: Gated (batch + dispatcher gate enabled) ──────────────
 
 run_gated() {
-    log "━━━ Scenario 2: GATED (batch load + gate enabled) ━━━"
+    log "━━━ Scenario 3: GATED (batch load + async dispatch + gate enabled) ━━━"
 
     # Start batch submission (runs concurrently with guidellm)
     run_batch_submit
@@ -161,10 +206,10 @@ run_gated() {
     cleanup_job "batch-submit"
 }
 
-# ── Scenario 3: Ungated (batch + gate disabled) ──────────────────────
+# ── Scenario 4: Ungated (batch + gate disabled) ──────────────────────
 
 run_ungated() {
-    log "━━━ Scenario 3: UNGATED (batch load + gate disabled) ━━━"
+    log "━━━ Scenario 4: UNGATED (batch load + async dispatch + gate disabled) ━━━"
 
     if [ -z "${ASYNC_CHART}" ] || [ -z "${ASYNC_VALUES}" ]; then
         log "Skipping ungated scenario: --async-chart and --async-values required"
@@ -209,7 +254,7 @@ print_summary() {
     echo "Results saved to: ${RESULTS_DIR}/"
     echo ""
     echo "Scenarios completed:"
-    for scenario in baseline gated ungated; do
+    for scenario in baseline sync gated ungated; do
         if [ -d "${RESULTS_DIR}/${scenario}" ]; then
             local files
             files=$(find "${RESULTS_DIR}/${scenario}" -name "*.json" 2>/dev/null | wc -l | tr -d ' ')
@@ -228,8 +273,9 @@ print_summary() {
     echo "  - output_tokens_per_second"
     echo ""
     echo "Expected outcome:"
+    echo "  - 'sync' metrics show degradation vs 'baseline' (no gating, direct inference)"
     echo "  - 'gated' metrics should closely match 'baseline' (gate protects live traffic)"
-    echo "  - 'ungated' metrics should show degradation vs 'baseline' (no protection)"
+    echo "  - 'ungated' metrics should show degradation vs 'baseline' (async but no gate)"
 }
 
 # ── Main ──────────────────────────────────────────────────────────────
@@ -242,6 +288,7 @@ main() {
 
     ensure_pvc
     run_baseline
+    run_sync
     run_gated
     run_ungated
     print_summary
