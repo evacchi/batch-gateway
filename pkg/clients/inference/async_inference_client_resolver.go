@@ -39,18 +39,31 @@ type AsyncClientConfig struct {
 // backed by a shared producer and dispatcher per pool.
 // Immutable after construction — safe for concurrent reads.
 type AsyncGatewayResolver struct {
-	pools   map[string]*asyncPool // model → pool
-	closers []io.Closer
+	pools            map[string]*asyncPool                    // model → pool
+	closers          []io.Closer
+	clientFactories  map[string]func() AsyncInferenceClient   // test-only override
 }
 
 // ClientFor creates a fresh per-job async client for the given model.
 // Returns nil if no matching pool exists.
 func (r *AsyncGatewayResolver) ClientFor(modelID string) AsyncInferenceClient {
+	if r.clientFactories != nil {
+		if factory, ok := r.clientFactories[modelID]; ok {
+			return factory()
+		}
+		return nil
+	}
 	pool, ok := r.pools[modelID]
 	if !ok {
 		return nil
 	}
 	return newAsyncProducerClient(pool)
+}
+
+// NewTestAsyncResolver creates an AsyncGatewayResolver backed by client factories
+// instead of real Redis pools. Each ClientFor call invokes the corresponding factory.
+func NewTestAsyncResolver(factories map[string]func() AsyncInferenceClient) *AsyncGatewayResolver {
+	return &AsyncGatewayResolver{clientFactories: factories}
 }
 
 // Close releases resources held by the resolver (dispatchers, producers, Redis).

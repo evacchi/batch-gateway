@@ -86,7 +86,7 @@ func testCrossServiceTracePropagation(t *testing.T, jaegerClient *http.Client) {
 		default:
 		}
 
-		resp, err := jaegerClient.Get(testJaegerURL + "/api/traces?service=batch-gateway&limit=10&lookback=2m")
+		resp, err := jaegerClient.Get(testJaegerURL + "/api/traces?service=async-processor&limit=20&lookback=5m")
 		if err != nil {
 			t.Logf("Jaeger query failed (retrying): %v", err)
 			time.Sleep(2 * time.Second)
