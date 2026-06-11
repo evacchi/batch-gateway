@@ -102,45 +102,6 @@ func (m *mockInferenceClient) Generate(ctx context.Context, req *inference.Gener
 	}, nil
 }
 
-// mockAsyncInferenceClient implements inference.AsyncInferenceClient for tests.
-type mockAsyncInferenceClient struct {
-	submitFn    func(ctx context.Context, req *inference.GenerateRequest) *inference.ClientError
-	getResultFn func(ctx context.Context) (*inference.GenerateResponse, error)
-}
-
-func (m *mockAsyncInferenceClient) Submit(ctx context.Context, req *inference.GenerateRequest) *inference.ClientError {
-	if m.submitFn != nil {
-		return m.submitFn(ctx, req)
-	}
-	return nil
-}
-
-func (m *mockAsyncInferenceClient) GetResult(ctx context.Context) (*inference.GenerateResponse, error) {
-	if m.getResultFn != nil {
-		return m.getResultFn(ctx)
-	}
-	return nil, ctx.Err()
-}
-
-func (m *mockAsyncInferenceClient) Close() error { return nil }
-
-var _ inference.AsyncInferenceClient = (*mockAsyncInferenceClient)(nil)
-
-// newChannelAsyncClient returns a mock async client that collects submitted
-// request IDs and delivers results from a channel.
-func newChannelAsyncClient(results chan *inference.GenerateResponse) *mockAsyncInferenceClient {
-	return &mockAsyncInferenceClient{
-		getResultFn: func(ctx context.Context) (*inference.GenerateResponse, error) {
-			select {
-			case r := <-results:
-				return r, nil
-			case <-ctx.Done():
-				return nil, ctx.Err()
-			}
-		},
-	}
-}
-
 // ---------------------------------------------------------------------------
 // Mock files client (upload retry testing)
 // ---------------------------------------------------------------------------
