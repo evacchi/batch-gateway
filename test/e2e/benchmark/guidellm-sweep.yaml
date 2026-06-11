@@ -1,0 +1,45 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: guidellm-sweep
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: guidellm
+          image: ghcr.io/vllm-project/guidellm:latest
+          env:
+            - name: USER
+              value: "guidellm"
+            - name: HF_HUB_CACHE
+              value: "/tmp/hf_cache"
+            - name: GUIDELLM_TARGET
+              value: "http://llm-d-inference-gateway-istio"
+            - name: GUIDELLM_MODEL
+              value: "Qwen/Qwen3-0.6B"
+            - name: GUIDELLM_MAX_SECONDS
+              value: "120"
+            - name: GUIDELLM_SCENARIO
+              value: "baseline"
+          command:
+            - sh
+            - -c
+            - |
+              guidellm benchmark run \
+                --target "${GUIDELLM_TARGET}" \
+                --request-format text_completions \
+                --model "${GUIDELLM_MODEL}" \
+                --profile sweep \
+                --max-seconds "${GUIDELLM_MAX_SECONDS}" \
+                --data "prompt_tokens=256,output_tokens=128" \
+                --output-dir "/results/${GUIDELLM_SCENARIO}" \
+                --processor "${GUIDELLM_MODEL}"
+          volumeMounts:
+            - name: results
+              mountPath: /results
+      volumes:
+        - name: results
+          persistentVolumeClaim:
+            claimName: benchmark-results
