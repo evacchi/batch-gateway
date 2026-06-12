@@ -3,24 +3,26 @@
 Measure whether batch requests degrade live (interactive) traffic quality,
 and how routing through the async dispatcher with a dispatch budget gate helps.
 
-The benchmark runs [guidellm](https://github.com/vllm-project/guidellm) in
-**sweep mode** against the inference gateway to produce a latency/throughput
-saturation curve across four scenarios:
+The benchmark uses [guidellm](https://github.com/vllm-project/guidellm) to
+generate a **burst/idle traffic pattern** (simulating real production traffic
+spikes) while batch requests run alongside. It compares two dispatch modes:
 
 | Scenario | Dispatch mode | Batch load | Gate |
 |----------|--------------|------------|------|
-| **baseline** | n/a | none | n/a |
-| **sync** | sync (direct) | 100 requests | none |
-| **gated** | async | 100 requests | prometheus-budget |
-| **ungated** | async | 100 requests | constant (always open) |
+| **sync** | sync (direct) | 50 requests | none |
+| **gated** | async | 50 requests | prometheus-budget |
+
+Each scenario runs guidellm in alternating phases:
+- **Burst**: 15 req/s for 60s (saturates the inference endpoint)
+- **Idle**: 1 req/s for 60s (leaves headroom for batch)
 
 **Expected outcome:**
-- **sync** shows degradation vs **baseline** — batch requests compete directly
-  with live traffic for inference capacity with no gating mechanism
-- **gated** should produce metrics close to **baseline** — the dispatch budget
-  gate throttles batch requests when the inference endpoint is under live load
-- **ungated** should show degradation similar to **sync** — async dispatch
-  without a gate provides no protection
+- **sync**: Batch requests cannot complete — they compete directly with live
+  traffic during bursts and retry with backoff, consuming capacity even during
+  idle periods
+- **gated**: Batch requests complete during idle phases — the dispatch budget
+  gate closes during bursts (protecting live traffic) and opens during idle
+  periods (filling unused capacity with batch work)
 
 ## Prerequisites
 
@@ -223,121 +225,110 @@ kubectl apply -n ${NAMESPACE} -f ${BATCH_REPO}/test/e2e/benchmark/results-pvc.ya
 
 ## Step 16: Run the benchmark
 
-The benchmark script orchestrates four scenarios sequentially:
+The benchmark requires **two namespaces** — one for sync dispatch, one for
+gated async dispatch. Deploy the full stack (Steps 1–15) in both namespaces,
+configuring the sync namespace with `processor-sync-values.yaml` and the
+async namespace with `processor-async-values.yaml`.
+
+```bash
+export SYNC_NAMESPACE=my-sync-ns
+export GATED_NAMESPACE=my-gated-ns
+```
+
+Run the benchmark script:
 
 ```bash
 cd ${BATCH_REPO}
 
-./test/e2e/benchmark/benchmark.sh \
-    --namespace ${NAMESPACE} \
-    --results-dir ./benchmark-results \
-    --batch-size 100 \
-    --max-seconds 120 \
-    --batch-release batch-gateway \
-    --batch-chart ${BATCH_REPO}/charts/batch-gateway/ \
-    --async-release async-processor \
-    --async-chart ${ASYNC_REPO}/charts/async-processor/ \
-    --async-values ${ASYNC_REPO}/docs/guides/e2e-deploy/async-processor-values.yaml
+python3 test/e2e/benchmark/benchmark.py \
+    --context <your-kubectl-context> \
+    --sync-namespace ${SYNC_NAMESPACE} \
+    --gated-namespace ${GATED_NAMESPACE} \
+    --batch-size 50 \
+    --burst-rate 15 \
+    --idle-rate 1 \
+    --phase-seconds 60 \
+    --cycles 2 \
+    --results-dir ./benchmark-results
 ```
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--namespace` | `llm-d-async` | Kubernetes namespace |
-| `--results-dir` | `./benchmark-results` | Local directory for collected results |
-| `--batch-size` | `100` | Number of requests in the batch workload |
-| `--max-seconds` | `120` | guidellm sweep duration per scenario |
-| `--batch-release` | `batch-gateway` | Helm release name of the batch-gateway |
-| `--batch-chart` | — | Path to batch-gateway Helm chart (required for sync scenario) |
-| `--async-release` | `async-processor` | Helm release name of the async-processor |
-| `--async-chart` | — | Path to async-processor Helm chart (required for ungated scenario) |
-| `--async-values` | — | Path to async-processor values file (required for ungated scenario) |
+| `--context` | (required) | kubectl context |
+| `--sync-namespace` | (required) | Namespace with sync dispatch |
+| `--gated-namespace` | (required) | Namespace with async dispatch + gate |
+| `--batch-size` | `50` | Number of requests in the batch workload |
+| `--burst-rate` | `15` | Requests/sec during burst phases |
+| `--idle-rate` | `1` | Requests/sec during idle phases |
+| `--phase-seconds` | `60` | Duration of each burst/idle phase |
+| `--cycles` | `2` | Number of burst→idle cycles |
+| `--results-dir` | `./benchmark-results` | Output directory |
 
 The script will:
-1. Run guidellm sweep with no batch load (**baseline**)
-2. Switch processor to sync mode, submit a batch, run guidellm sweep (**sync**)
-3. Switch processor back to async mode, submit a batch, run guidellm sweep (**gated**)
-4. Reconfigure the dispatcher gate to `constant` (always open), submit a batch,
-   run guidellm sweep (**ungated**)
-5. Restore the original gate configuration
-6. Print a summary of collected results
+1. Clean up stale data (flush Redis, truncate PostgreSQL, restart processors)
+2. Submit a batch, then start the burst/idle guidellm pattern (**sync**)
+3. Monitor batch progress throughout, recording a timeline
+4. Repeat for the **gated** namespace
+5. Collect guidellm CSVs from both namespaces
+6. Generate an HTML report with charts at `benchmark-results/report.html`
 
-The **sync** scenario requires `--batch-chart`. The **ungated** scenario
-requires `--async-chart` and `--async-values`. Missing flags cause the
-respective scenario to be skipped.
+### Cleanup between runs
 
-## Running individual scenarios
-
-You can run the guidellm sweep or batch submission Jobs independently.
-
-The guidellm-sweep.yaml uses `envsubst` templating — set environment variables
-before applying:
-
-### guidellm sweep only
+The benchmark script handles cleanup automatically, but if running manually:
 
 ```bash
-export GUIDELLM_SCENARIO=manual-test
-export GUIDELLM_MAX_SECONDS=120
-export GUIDELLM_TARGET="http://llm-d-inference-gateway-istio"
-export GUIDELLM_MODEL="Qwen/Qwen3-0.6B"
-envsubst < test/e2e/benchmark/guidellm-sweep.yaml | kubectl apply -n ${NAMESPACE} -f -
+# Scale down processors
+kubectl scale deployment batch-gateway-processor batch-gateway-apiserver -n ${NAMESPACE} --replicas=0
 
-kubectl wait --for=condition=complete job/guidellm-sweep -n ${NAMESPACE} --timeout=300s
-kubectl logs job/guidellm-sweep -n ${NAMESPACE}
-```
+# Delete all Redis keys (FLUSHALL is disabled on Bitnami Redis)
+kubectl run --rm -i redis-del -n ${NAMESPACE} --image=redis --restart=Never -- \
+    sh -c 'for key in $(redis-cli -h redis-master KEYS "*"); do redis-cli -h redis-master DEL "$key"; done'
 
-### Batch submission only
+# Truncate PostgreSQL
+kubectl run --rm -i pg-nuke -n ${NAMESPACE} --image=postgres:16 --restart=Never \
+    --env=PGPASSWORD=benchmarkpw -- \
+    psql -h postgresql -U postgres -d batchgateway -c "TRUNCATE batch_items, file_items CASCADE;"
 
-The batch-submit Job uses container env vars (no envsubst). Apply directly:
-
-```bash
-kubectl apply -n ${NAMESPACE} -f test/e2e/benchmark/batch-submit.yaml
-
-kubectl logs -f job/batch-submit -n ${NAMESPACE}
-```
-
-To override defaults, patch the env vars before applying:
-
-```bash
-sed -e 's|http://batch-gateway-apiserver:8000|http://my-gateway:8000|' \
-    -e 's|value: "100"|value: "50"|' \
-    test/e2e/benchmark/batch-submit.yaml | kubectl apply -n ${NAMESPACE} -f -
+# Scale back up
+kubectl scale deployment batch-gateway-processor batch-gateway-apiserver -n ${NAMESPACE} --replicas=1
 ```
 
 ## Interpret results
 
-Results are collected as JSON and CSV files under `./benchmark-results/` (e.g.,
-`baseline.json`, `gated.json`). Each JSON file contains guidellm's standard
-benchmark output with per-request metrics.
+The HTML report (`benchmark-results/report.html`) includes:
 
-Key metrics to compare across scenarios:
+- **Batch completion timeline**: Shows completed requests over time for both
+  scenarios. The gated line should show a staircase pattern — flat during bursts
+  (gate closed), rising during idle phases (gate open). The sync line should
+  stay flat (no progress under load).
 
-| Metric | What it measures |
-|--------|-----------------|
-| `time_to_first_token_ms` | Initial response latency (TTFT) |
-| `inter_token_latency_ms` | Speed of subsequent token generation (ITL) |
-| `request_latency` | End-to-end request duration |
-| `requests_per_second` | Throughput |
-| `output_tokens_per_second` | Token generation throughput |
+- **TTFT comparison**: Time-to-first-token across burst and idle phases for
+  both scenarios.
 
-Look at the sweep curve inflection point across scenarios:
-- **sync** vs **baseline**: shows the cost of uncontrolled batch traffic
-  competing directly with live requests for inference capacity
-- **gated** vs **baseline**: if the curves match, the dispatch budget gate is
-  working — batch requests back off when the endpoint is saturated
-- **ungated** vs **baseline**: shows that async dispatch alone (without a gate)
-  does not protect live traffic — degradation should be similar to **sync**
+- **Detailed metrics table**: Per-phase breakdown of TTFT, ITL, request
+  latency, throughput, completed requests, and errors.
+
+### What to look for
+
+- **Batch completion**: Gated completes batch requests during idle phases; sync
+  cannot complete any under burst load
+- **Live traffic quality**: TTFT and ITL during burst phases should be similar
+  between sync and gated — the gate protects live traffic without degrading it
+- **Gate responsiveness**: The delay between a burst ending and batch
+  resuming shows the Prometheus scrape interval lag (~15s)
 
 ## Customizing the workload
 
-Edit `test/e2e/benchmark/guidellm-sweep.yaml` to change the guidellm
-parameters:
+Edit `benchmark.py` parameters or the inline Job YAML to change:
 
-- `--data "prompt_tokens=256,output_tokens=128"` — adjust prompt/output token
-  counts to simulate different workload profiles (e.g., `prompt_tokens=2000,output_tokens=500`
-  for summarization-like traffic)
-- `--profile constant --rate 50` — switch from sweep to constant-rate load
-  (useful for sustained-load comparison rather than saturation curve)
-- `--request-format chat_completions` — switch to chat completion format
+- `--burst-rate` / `--idle-rate` — adjust traffic intensity
+- `--phase-seconds` — longer phases show more batch progress
+- `--data "prompt_tokens=2000,output_tokens=500"` in the guidellm command —
+  simulate summarization-like traffic instead of short prompts
+
+> **Note:** Do not use `GUIDELLM_*` as environment variable names in Job
+> manifests. guidellm auto-reads environment variables matching this prefix
+> as CLI flags, which causes unexpected behavior.
 
 ## Cleanup
 

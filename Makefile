@@ -3,6 +3,8 @@
 SHELL := /usr/bin/env bash
 
 TARGETARCH ?= $(shell go env GOARCH)
+HOSTARCH := $(shell go env GOARCH)
+CROSS_BUILD_FLAGS := $(if $(filter-out $(HOSTARCH),$(TARGETARCH)),--no-cache,)
 
 # Variables
 IMAGE_TAG ?= 0.0.1
@@ -271,6 +273,7 @@ check-container-tool:
 image-build-apiserver: check-container-tool
 	@printf "\033[33;1m==== Building Docker image $(APISERVER_IMG) ====\033[0m\n"
 	$(CONTAINER_TOOL) build \
+		$(CROSS_BUILD_FLAGS) \
 		--platform linux/$(TARGETARCH) \
 		--build-arg TARGETOS=linux \
 		--build-arg TARGETARCH=$(TARGETARCH) \
@@ -281,6 +284,7 @@ image-build-apiserver: check-container-tool
 image-build-processor: check-container-tool
 	@printf "\033[33;1m==== Building Docker image $(PROCESSOR_IMG) ====\033[0m\n"
 	$(CONTAINER_TOOL) build \
+		$(CROSS_BUILD_FLAGS) \
 		--platform linux/$(TARGETARCH) \
 		--build-arg TARGETOS=linux \
 		--build-arg TARGETARCH=$(TARGETARCH) \
@@ -291,6 +295,7 @@ image-build-processor: check-container-tool
 image-build-gc: check-container-tool
 	@printf "\033[33;1m==== Building Docker image $(GC_IMG) ====\033[0m\n"
 	$(CONTAINER_TOOL) build \
+		$(CROSS_BUILD_FLAGS) \
 		--platform linux/$(TARGETARCH) \
 		--build-arg TARGETOS=linux \
 		--build-arg TARGETARCH=$(TARGETARCH) \

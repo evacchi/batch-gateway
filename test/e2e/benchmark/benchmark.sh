@@ -89,10 +89,18 @@ cleanup_job() {
 apply_with_env() {
     local file="$1"
     shift
-    # Export all config vars for envsubst
+    # Export all config vars and substitute only the explicit list.
+    # Using an explicit variable list prevents envsubst from destroying
+    # shell variables ($cycle, $TARGET, etc.) inside script bodies.
     export GUIDELLM_TARGET GUIDELLM_MODEL GUIDELLM_MAX_SECONDS GUIDELLM_SCENARIO
-    export BATCH_GATEWAY_URL BATCH_MODEL BATCH_SIZE
-    envsubst < "${file}" | kubectl apply -n "${NAMESPACE}" "$@" -f -
+    export GUIDELLM_PROFILE GUIDELLM_RATE
+    export BENCH_TARGET BENCH_MODEL BENCH_SCENARIO
+    export BENCH_BURST_RATE BENCH_IDLE_RATE BENCH_PHASE_SECONDS BENCH_NUM_CYCLES
+    local vars='$GUIDELLM_TARGET $GUIDELLM_MODEL $GUIDELLM_MAX_SECONDS $GUIDELLM_SCENARIO'
+    vars="$vars"' $GUIDELLM_PROFILE $GUIDELLM_RATE'
+    vars="$vars"' $BENCH_TARGET $BENCH_MODEL $BENCH_SCENARIO'
+    vars="$vars"' $BENCH_BURST_RATE $BENCH_IDLE_RATE $BENCH_PHASE_SECONDS $BENCH_NUM_CYCLES'
+    envsubst "$vars" < "${file}" | kubectl apply -n "${NAMESPACE}" "$@" -f -
 }
 
 collect_results() {
@@ -145,6 +153,12 @@ run_guidellm_sweep() {
     wait_for_job "guidellm-sweep" "${timeout}"
     collect_results "${scenario}"
     cleanup_job "guidellm-sweep"
+}
+
+flush_redis() {
+    log "Flushing Redis to clear stale batches and queues"
+    kubectl run --rm -i redis-flush-$$ -n "${NAMESPACE}" --image=redis --restart=Never \
+        -- redis-cli -h redis-master FLUSHDB 2>/dev/null || true
 }
 
 run_batch_submit() {
@@ -205,6 +219,7 @@ run_sync() {
         return 0
     fi
 
+    flush_redis
     run_batch_submit
     sleep 10
 
@@ -222,7 +237,7 @@ run_sync() {
 run_gated() {
     log "━━━ Scenario 3: GATED (batch load + async dispatch + gate enabled) ━━━"
 
-    # Start batch submission (runs concurrently with guidellm)
+    flush_redis
     run_batch_submit
     sleep 10  # let batch requests start flowing
 
@@ -256,6 +271,7 @@ run_ungated() {
     kubectl rollout status deployment -l "app.kubernetes.io/name=async-processor" -n "${NAMESPACE}" --timeout=120s
 
     # Start batch submission + guidellm
+    flush_redis
     run_batch_submit
     sleep 10
 
