@@ -560,6 +560,27 @@ def generate_html_report(results_dir: Path, sync_timeline, gated_timeline,
         if sync_timeline[-1].get("total", 0) > 0:
             cfg_batch_size = sync_timeline[-1]["total"]
 
+    # Compute live traffic impact metrics from burst phases
+    def burst_stats(metrics_dict):
+        successful, total, ttft_sum, count = 0, 0, 0.0, 0
+        for name, ms in metrics_dict.items():
+            if "burst" in name and ms:
+                m = ms[0]
+                successful += m.completed
+                total += m.completed + m.errors
+                ttft_sum += m.ttft_p50
+                count += 1
+        ttft_avg = ttft_sum / count if count else 0
+        return successful, total, ttft_avg
+
+    sync_burst_successful, sync_burst_total, sync_burst_ttft_val = burst_stats(sync_metrics)
+    gated_burst_successful, gated_burst_total, gated_burst_ttft_val = burst_stats(gated_metrics)
+
+    sync_burst_success_rate = f"{sync_burst_successful}/{sync_burst_total} ({sync_burst_successful*100//max(sync_burst_total,1)}%)" if sync_burst_total else "N/A"
+    gated_burst_success_rate = f"{gated_burst_successful}/{gated_burst_total} ({gated_burst_successful*100//max(gated_burst_total,1)}%)" if gated_burst_total else "N/A"
+    sync_burst_ttft = f"{sync_burst_ttft_val:.1f} ms" if sync_burst_ttft_val else "N/A"
+    gated_burst_ttft = f"{gated_burst_ttft_val:.1f} ms" if gated_burst_ttft_val else "N/A"
+
     html = textwrap.dedent(f"""\
     <!DOCTYPE html>
     <html>
@@ -633,6 +654,44 @@ def generate_html_report(results_dir: Path, sync_timeline, gated_timeline,
                 <div class="value good">{gated_batch_burst} reqs</div>
                 <div class="detail">Gate throttles batch &mdash; only excess capacity used, live traffic protected</div>
             </div>
+            <div class="metric-box">
+                <h4>Sync: Batch during Idle</h4>
+                <div class="value">{sync_batch_idle} reqs</div>
+                <div class="detail">Batch requests processed during idle &mdash; competes with live traffic at all times</div>
+            </div>
+            <div class="metric-box">
+                <h4>Gated: Batch during Idle</h4>
+                <div class="value good">{gated_batch_idle} reqs</div>
+                <div class="detail">Gate opens &mdash; batch fills unused capacity when live traffic is low</div>
+            </div>
+        </div>
+
+        <h2>Live Traffic Impact</h2>
+        <p>Each burst phase sends requests at {cfg_burst_rate} req/s for {cfg_burst_sec}s. Requests still in-flight
+        when the phase window closes are marked <strong>incomplete</strong> &mdash; they were delayed by GPU
+        contention from concurrent batch processing. Every batch request dispatched during burst is capacity
+        stolen from live traffic.</p>
+        <div class="metric-grid">
+            <div class="metric-box">
+                <h4>Sync: Live Burst Success Rate</h4>
+                <div class="value bad">{sync_burst_success_rate}</div>
+                <div class="detail">{sync_burst_successful} of {sync_burst_total} requests completed in time</div>
+            </div>
+            <div class="metric-box">
+                <h4>Gated: Live Burst Success Rate</h4>
+                <div class="value good">{gated_burst_success_rate}</div>
+                <div class="detail">{gated_burst_successful} of {gated_burst_total} requests completed in time</div>
+            </div>
+            <div class="metric-box">
+                <h4>Sync: Burst TTFT (median)</h4>
+                <div class="value bad">{sync_burst_ttft}</div>
+                <div class="detail">Higher TTFT = batch requests are delaying live traffic first-token latency</div>
+            </div>
+            <div class="metric-box">
+                <h4>Gated: Burst TTFT (median)</h4>
+                <div class="value good">{gated_burst_ttft}</div>
+                <div class="detail">Gate holds batch back &mdash; live traffic gets full GPU priority</div>
+            </div>
         </div>
 
         <h2>Batch Completion Timeline</h2>
@@ -678,14 +737,18 @@ def generate_html_report(results_dir: Path, sync_timeline, gated_timeline,
 
         <div class="card" style="margin-top: 40px">
             <h2 style="margin-top:0">Conclusion</h2>
-            <p>Without the dispatch budget gate (<strong>sync</strong>), the batch processor sends all
+            <p>Without the dispatch budget gate (<strong>sync</strong>), the batch processor sends
             {cfg_batch_size} requests directly to the inference gateway during burst, competing with
-            {cfg_burst_rate} req/s of live traffic for GPU compute. This increases TTFT and causes
-            request timeouts.</p>
+            {cfg_burst_rate} req/s of live traffic for GPU compute. During burst phases,
+            <strong>{sync_burst_successful} of {sync_burst_total}</strong> live requests completed
+            in time (TTFT {sync_burst_ttft}), while <strong>{sync_batch_burst}</strong> batch requests
+            consumed GPU capacity that could have served live traffic.</p>
             <p>With the <strong>prometheus-budget gate</strong>, the async-processor monitors GPU
             utilization via Prometheus and holds back batch requests when the inference endpoint is
-            saturated. Batch requests only dispatch during idle periods when there is spare capacity,
-            preserving live traffic quality.</p>
+            saturated. During burst, only <strong>{gated_batch_burst}</strong> batch requests were
+            dispatched, allowing <strong>{gated_burst_successful} of {gated_burst_total}</strong>
+            live requests to complete (TTFT {gated_burst_ttft}). Batch work shifts to idle periods
+            ({gated_batch_idle} requests processed during idle) when GPU capacity is available.</p>
         </div>
 
         <script>
