@@ -26,51 +26,202 @@ saturation curve across four scenarios:
 
 - Kubernetes cluster with GPU nodes (A100 tested)
 - `kubectl`, `helm`, `jq`, `envsubst` installed
-- The llm-d stack deployed with the async processor — follow the
-  [llm-d-async e2e deploy guide](https://github.com/llm-d-incubation/llm-d-async/blob/main/docs/guides/e2e-deploy.md)
-  through **Step 9** (CRDs, Istio, gateway, EPP, vLLM, Prometheus, Redis,
-  async-processor with prometheus-budget gate)
-- batch-gateway deployed and configured for async dispatch (see Step 1 below)
+- Local checkouts of:
+  - [llm-d](https://github.com/llm-d/llm-d)
+  - [llm-d-async](https://github.com/llm-d-incubation/llm-d-async)
+  - [llm-d-router](https://github.com/llm-d/llm-d-router)
+  - this repo (llm-d-batch-gateway)
 
 ```bash
 export LLM_D_REPO=/path/to/llm-d
 export ASYNC_REPO=/path/to/llm-d-async
+export ROUTER_REPO=/path/to/llm-d-router
 export BATCH_REPO=/path/to/llm-d-batch-gateway   # this repo
-export NAMESPACE=llm-d-async
+export NAMESPACE=llm-d-async                      # or your namespace
+export GUIDE_NAME=optimized-baseline
 ```
 
-## Step 1: Configure batch-gateway for async dispatch
-
-The batch-gateway processor needs to route requests through the dispatcher
-instead of calling the inference endpoint directly.
+## Step 1: Install CRDs (skip if already installed)
 
 ```bash
-# Get current processor values
-helm get values batch-gateway -n ${NAMESPACE} -o yaml > /tmp/current-values.yaml
+GATEWAY_API_VERSION=v1.5.1
+GAIE_VERSION=v1.5.0
 
-# Upgrade with async dispatch enabled
-helm upgrade batch-gateway ${BATCH_REPO}/charts/batch-gateway/ \
-    -f /tmp/current-values.yaml \
-    -f ${BATCH_REPO}/test/e2e/benchmark/processor-async-values.yaml \
-    -n ${NAMESPACE}
-
-kubectl rollout restart deployment -l app.kubernetes.io/component=processor -n ${NAMESPACE}
-kubectl rollout status deployment -l app.kubernetes.io/component=processor -n ${NAMESPACE} --timeout=120s
+kubectl apply -k "https://github.com/kubernetes-sigs/gateway-api/config/crd?ref=${GATEWAY_API_VERSION}"
+kubectl apply -k "https://github.com/kubernetes-sigs/gateway-api-inference-extension/config/crd?ref=${GAIE_VERSION}"
 ```
 
-The `processor-async-values.yaml` sets:
-- `dispatchMode: async` — routes requests through the dispatcher
-- `resultPollTimeout: 30s` — how long the processor waits for each result
-- Model `Qwen/Qwen3-0.6B` → pool `optimized-baseline` — maps the model to
-  the dispatcher's queue/pool
+## Step 2: Create namespace
 
-## Step 2: Create the results PVC
+```bash
+kubectl create namespace ${NAMESPACE}
+```
+
+## Step 3: Install Istio (skip if already installed)
+
+```bash
+kubectl get pods -n istio-system  # check first
+
+# If not installed:
+ISTIO_VERSION=1.29.0
+curl -L https://istio.io/downloadIstio | ISTIO_VERSION=${ISTIO_VERSION} sh -
+export PATH="$PWD/istio-${ISTIO_VERSION}/bin:$PATH"
+istioctl install -y --set values.pilot.env.ENABLE_GATEWAY_API_INFERENCE_EXTENSION=true
+```
+
+## Step 4: Deploy Gateway
+
+```bash
+kubectl apply -k ${LLM_D_REPO}/guides/recipes/gateway/istio -n ${NAMESPACE}
+kubectl wait --for=jsonpath='{.status.conditions[?(@.type=="Programmed")].status}'=True \
+    gateway/llm-d-inference-gateway -n ${NAMESPACE} --timeout=120s
+```
+
+## Step 5: Deploy llm-d Router (EPP) with HTTPRoute and monitoring
+
+Build the chart dependencies first:
+
+```bash
+cd ${ROUTER_REPO}/config/charts/llm-d-router-gateway && helm dependency build && cd -
+```
+
+Install with HTTPRoute enabled so the gateway routes traffic to the EPP:
+
+```bash
+helm install ${GUIDE_NAME} \
+    ${ROUTER_REPO}/config/charts/llm-d-router-gateway/ \
+    -f ${LLM_D_REPO}/guides/recipes/router/base.values.yaml \
+    -f ${LLM_D_REPO}/guides/${GUIDE_NAME}/router/${GUIDE_NAME}.values.yaml \
+    -f ${LLM_D_REPO}/guides/recipes/router/features/monitoring.values.yaml \
+    --set router.inferencePool.gatewayRef.name=llm-d-inference-gateway \
+    --set httpRoute.create=true \
+    --set httpRoute.inferenceGatewayName=llm-d-inference-gateway \
+    -n ${NAMESPACE}
+```
+
+## Step 6: Deploy vLLM model server (Qwen/Qwen3-0.6B)
+
+```bash
+kubectl apply -n ${NAMESPACE} -k ${ASYNC_REPO}/docs/guides/e2e-deploy/modelserver/
+kubectl wait --for=condition=Ready pod -l llm-d.ai/role=decode -n ${NAMESPACE} --timeout=300s
+```
+
+## Step 7: Install Prometheus (skip if already installed)
+
+```bash
+cd ${LLM_D_REPO}
+./docs/monitoring/scripts/install-prometheus-grafana.sh
+```
+
+Verify EPP metrics are flowing:
+
+```bash
+kubectl run --rm -i prom-check --image=curlimages/curl --restart=Never -n ${NAMESPACE} -- \
+    curl -s "http://llmd-kube-prometheus-stack-prometheus.llm-d-monitoring.svc.cluster.local:9090/api/v1/query?query=inference_pool_ready_pods"
+```
+
+## Step 8: Install Redis
+
+```bash
+helm install redis bitnami/redis -n ${NAMESPACE} --set auth.enabled=false
+```
+
+## Step 9: Install PostgreSQL
+
+The batch-gateway uses PostgreSQL as its metadata store.
+
+```bash
+helm install postgresql bitnami/postgresql -n ${NAMESPACE} \
+    --set auth.postgresPassword=benchmarkpw \
+    --set auth.database=batchgateway \
+    --set primary.persistence.size=5Gi
+
+kubectl wait --for=condition=Ready pod -l app.kubernetes.io/name=postgresql \
+    -n ${NAMESPACE} --timeout=120s
+```
+
+## Step 10: Create batch-gateway secrets
+
+```bash
+kubectl create secret generic batch-gateway-secrets -n ${NAMESPACE} \
+    --from-literal=redis-url="redis://redis-master.${NAMESPACE}.svc.cluster.local:6379" \
+    --from-literal=postgresql-url="postgresql://postgres:benchmarkpw@postgresql.${NAMESPACE}.svc.cluster.local:5432/batchgateway?sslmode=disable" \
+    --from-literal=inference-api-key="" \
+    --from-literal=s3-secret-access-key=""
+```
+
+## Step 11: Create batch-gateway files PVC
+
+```bash
+kubectl apply -n ${NAMESPACE} -f - <<EOF
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: batch-gateway-files
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 5Gi
+EOF
+```
+
+## Step 12: Deploy batch-gateway
+
+Start in **sync** dispatch mode for the baseline and sync scenarios:
+
+```bash
+helm install batch-gateway ${BATCH_REPO}/charts/batch-gateway/ \
+    -f ${BATCH_REPO}/test/e2e/benchmark/processor-sync-values.yaml \
+    --set 'global.secretName=batch-gateway-secrets' \
+    --set 'global.fileClient.type=fs' \
+    --set 'global.fileClient.fs.pvcName=batch-gateway-files' \
+    --set 'gc.enabled=false' \
+    -n ${NAMESPACE}
+```
+
+## Step 13: Deploy async processor with dispatch budget gate
+
+```bash
+helm install async-processor ${ASYNC_REPO}/charts/async-processor/ \
+    -f ${ASYNC_REPO}/docs/guides/e2e-deploy/async-processor-values.yaml \
+    --set "ap.redis.url=redis://redis-master.${NAMESPACE}.svc.cluster.local:6379" \
+    -n ${NAMESPACE}
+```
+
+> **Note:** The `async-processor-values.yaml` references image tag `938cd44`.
+> If you need a newer version, override with
+> `--set ap.image.repository=<repo> --set ap.image.tag=<tag>`.
+> The image must be built for `linux/amd64` — if building on Apple Silicon, use
+> `docker buildx build --platform linux/amd64`.
+
+The async processor is not needed for the baseline and sync scenarios. You can
+scale it to 0 initially and bring it up for the gated/ungated scenarios:
+
+```bash
+kubectl scale deployment async-processor -n ${NAMESPACE} --replicas=0
+```
+
+## Step 14: Verify the stack
+
+```bash
+# All pods running
+kubectl get pods -n ${NAMESPACE}
+
+# Gateway routes to vLLM
+kubectl run --rm -i test-gateway --image=curlimages/curl --restart=Never \
+    -n ${NAMESPACE} -- curl -s "http://llm-d-inference-gateway-istio/v1/models"
+# Expected: JSON with "id":"Qwen/Qwen3-0.6B"
+```
+
+## Step 15: Create the results PVC
 
 ```bash
 kubectl apply -n ${NAMESPACE} -f ${BATCH_REPO}/test/e2e/benchmark/results-pvc.yaml
 ```
 
-## Step 3: Run the benchmark
+## Step 16: Run the benchmark
 
 The benchmark script orchestrates four scenarios sequentially:
 
@@ -114,10 +265,49 @@ The **sync** scenario requires `--batch-chart`. The **ungated** scenario
 requires `--async-chart` and `--async-values`. Missing flags cause the
 respective scenario to be skipped.
 
-## Step 4: Interpret results
+## Running individual scenarios
 
-Results are collected as JSON files under `./benchmark-results/<scenario>/`.
-Each file contains guidellm's standard benchmark output with per-request metrics.
+You can run the guidellm sweep or batch submission Jobs independently.
+
+The guidellm-sweep.yaml uses `envsubst` templating — set environment variables
+before applying:
+
+### guidellm sweep only
+
+```bash
+export GUIDELLM_SCENARIO=manual-test
+export GUIDELLM_MAX_SECONDS=120
+export GUIDELLM_TARGET="http://llm-d-inference-gateway-istio"
+export GUIDELLM_MODEL="Qwen/Qwen3-0.6B"
+envsubst < test/e2e/benchmark/guidellm-sweep.yaml | kubectl apply -n ${NAMESPACE} -f -
+
+kubectl wait --for=condition=complete job/guidellm-sweep -n ${NAMESPACE} --timeout=300s
+kubectl logs job/guidellm-sweep -n ${NAMESPACE}
+```
+
+### Batch submission only
+
+The batch-submit Job uses container env vars (no envsubst). Apply directly:
+
+```bash
+kubectl apply -n ${NAMESPACE} -f test/e2e/benchmark/batch-submit.yaml
+
+kubectl logs -f job/batch-submit -n ${NAMESPACE}
+```
+
+To override defaults, patch the env vars before applying:
+
+```bash
+sed -e 's|http://batch-gateway-apiserver:8000|http://my-gateway:8000|' \
+    -e 's|value: "100"|value: "50"|' \
+    test/e2e/benchmark/batch-submit.yaml | kubectl apply -n ${NAMESPACE} -f -
+```
+
+## Interpret results
+
+Results are collected as JSON and CSV files under `./benchmark-results/` (e.g.,
+`baseline.json`, `gated.json`). Each JSON file contains guidellm's standard
+benchmark output with per-request metrics.
 
 Key metrics to compare across scenarios:
 
@@ -137,30 +327,6 @@ Look at the sweep curve inflection point across scenarios:
 - **ungated** vs **baseline**: shows that async dispatch alone (without a gate)
   does not protect live traffic — degradation should be similar to **sync**
 
-## Running individual scenarios
-
-You can run the guidellm sweep or batch submission Jobs independently:
-
-### guidellm sweep only
-
-```bash
-export GUIDELLM_SCENARIO=manual-test
-export GUIDELLM_MAX_SECONDS=120
-envsubst < test/e2e/benchmark/guidellm-sweep.yaml | kubectl apply -n ${NAMESPACE} -f -
-
-kubectl wait --for=condition=complete job/guidellm-sweep -n ${NAMESPACE} --timeout=300s
-kubectl logs job/guidellm-sweep -n ${NAMESPACE}
-```
-
-### Batch submission only
-
-```bash
-export BATCH_SIZE=50
-envsubst < test/e2e/benchmark/batch-submit.yaml | kubectl apply -n ${NAMESPACE} -f -
-
-kubectl logs -f job/batch-submit -n ${NAMESPACE}
-```
-
 ## Customizing the workload
 
 Edit `test/e2e/benchmark/guidellm-sweep.yaml` to change the guidellm
@@ -173,36 +339,18 @@ parameters:
   (useful for sustained-load comparison rather than saturation curve)
 - `--request-format chat_completions` — switch to chat completion format
 
-## Local testing (Kind cluster with vLLM simulator)
-
-The benchmark can be smoke-tested locally using the Kind cluster and vLLM
-simulator from the dev-deploy setup. Note that the vLLM simulator has fixed
-latency, so the results will **not show realistic saturation behavior** — this
-is only useful for verifying the script runs end-to-end.
-
-```bash
-# Deploy the base cluster and dispatcher
-make dev-deploy
-make dev-deploy-dispatcher
-
-# The Kind setup uses different service names and ports.
-# Edit guidellm-sweep.yaml to target the simulator:
-#   GUIDELLM_TARGET: "http://vllm-sim.default.svc.cluster.local:8000"
-#   GUIDELLM_MODEL: "sim-model"
-# Edit batch-submit.yaml:
-#   BATCH_GATEWAY_URL: "https://batch-gateway-apiserver.default.svc.cluster.local:443"
-#   BATCH_MODEL: "sim-model"
-
-# Run the benchmark
-NAMESPACE=default ./test/e2e/benchmark/benchmark.sh \
-    --results-dir ./benchmark-results \
-    --batch-size 10 \
-    --max-seconds 30
-```
-
 ## Cleanup
 
 ```bash
 kubectl delete job guidellm-sweep batch-submit -n ${NAMESPACE} --ignore-not-found
 kubectl delete pvc benchmark-results -n ${NAMESPACE} --ignore-not-found
+helm uninstall batch-gateway -n ${NAMESPACE}
+helm uninstall async-processor -n ${NAMESPACE}
+helm uninstall redis -n ${NAMESPACE}
+helm uninstall postgresql -n ${NAMESPACE}
+kubectl delete secret batch-gateway-secrets -n ${NAMESPACE}
+kubectl delete pvc batch-gateway-files -n ${NAMESPACE}
+kubectl delete -n ${NAMESPACE} -k ${ASYNC_REPO}/docs/guides/e2e-deploy/modelserver/
+helm uninstall ${GUIDE_NAME} -n ${NAMESPACE}
+kubectl delete -k ${LLM_D_REPO}/guides/recipes/gateway/istio -n ${NAMESPACE}
 ```

@@ -12,7 +12,7 @@ spec:
           image: curlimages/curl:latest
           env:
             - name: BATCH_GATEWAY_URL
-              value: "https://batch-gateway-apiserver:443"
+              value: "http://batch-gateway-apiserver:8000"
             - name: BATCH_MODEL
               value: "Qwen/Qwen3-0.6B"
             - name: BATCH_SIZE
@@ -26,9 +26,8 @@ spec:
               # Generate JSONL input file
               JSONL_FILE="/tmp/batch-input.jsonl"
               i=0
-              while [ "$i" -lt "${BATCH_SIZE}" ]; do
-                printf '{"custom_id":"bench-%04d","method":"POST","url":"/v1/chat/completions","body":{"model":"%s","max_tokens":128,"messages":[{"role":"user","content":"Write a short paragraph about request number %d."}]}}\n' \
-                  "$i" "${BATCH_MODEL}" "$i" >> "${JSONL_FILE}"
+              while [ "$i" -lt "$BATCH_SIZE" ]; do
+                echo "{\"custom_id\":\"bench-${i}\",\"method\":\"POST\",\"url\":\"/v1/chat/completions\",\"body\":{\"model\":\"${BATCH_MODEL}\",\"max_tokens\":128,\"messages\":[{\"role\":\"user\",\"content\":\"Write a short paragraph about request number ${i}.\"}]}}" >> "$JSONL_FILE"
                 i=$((i + 1))
               done
               echo "Generated ${BATCH_SIZE} requests in ${JSONL_FILE}"

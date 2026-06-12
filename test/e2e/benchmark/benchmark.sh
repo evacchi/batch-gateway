@@ -28,6 +28,10 @@ NAMESPACE="${NAMESPACE:-llm-d-async}"
 RESULTS_DIR="${RESULTS_DIR:-./benchmark-results}"
 BATCH_SIZE="${BATCH_SIZE:-100}"
 GUIDELLM_MAX_SECONDS="${GUIDELLM_MAX_SECONDS:-120}"
+GUIDELLM_TARGET="${GUIDELLM_TARGET:-http://llm-d-inference-gateway-istio}"
+GUIDELLM_MODEL="${GUIDELLM_MODEL:-Qwen/Qwen3-0.6B}"
+BATCH_GATEWAY_URL="${BATCH_GATEWAY_URL:-http://batch-gateway-apiserver:8000}"
+BATCH_MODEL="${BATCH_MODEL:-Qwen/Qwen3-0.6B}"
 BATCH_RELEASE="${BATCH_RELEASE:-batch-gateway}"
 BATCH_CHART="${BATCH_CHART:-}"
 ASYNC_RELEASE="${ASYNC_RELEASE:-async-processor}"
@@ -85,25 +89,43 @@ cleanup_job() {
 apply_with_env() {
     local file="$1"
     shift
-    # Apply YAML with environment variable substitution
+    # Export all config vars for envsubst
+    export GUIDELLM_TARGET GUIDELLM_MODEL GUIDELLM_MAX_SECONDS GUIDELLM_SCENARIO
+    export BATCH_GATEWAY_URL BATCH_MODEL BATCH_SIZE
     envsubst < "${file}" | kubectl apply -n "${NAMESPACE}" "$@" -f -
 }
 
 collect_results() {
     local scenario="$1"
-    local dest="${RESULTS_DIR}/${scenario}"
+    local dest="${RESULTS_DIR}"
     mkdir -p "${dest}"
 
-    # Find the guidellm pod and copy results
-    local pod
-    pod=$(kubectl get pods -n "${NAMESPACE}" -l job-name=guidellm-sweep \
-        -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
-    if [ -n "${pod}" ]; then
-        kubectl cp "${NAMESPACE}/${pod}:/results/${scenario}" "${dest}" 2>/dev/null || true
-        log "Results collected to ${dest}"
-    else
-        log "Warning: could not find guidellm pod for result collection"
-    fi
+    # Spin up a helper pod to copy results from the PVC (completed pods can't serve kubectl cp)
+    local helper="results-helper-$$"
+    kubectl run "${helper}" -n "${NAMESPACE}" --image=busybox --restart=Never \
+        --overrides='{
+            "spec": {
+                "containers": [{
+                    "name": "helper",
+                    "image": "busybox",
+                    "command": ["sleep", "300"],
+                    "volumeMounts": [{"name": "results", "mountPath": "/results"}]
+                }],
+                "volumes": [{
+                    "name": "results",
+                    "persistentVolumeClaim": {"claimName": "benchmark-results"}
+                }]
+            }
+        }' 2>/dev/null
+    kubectl wait --for=condition=Ready "pod/${helper}" -n "${NAMESPACE}" --timeout=60s 2>/dev/null
+
+    # Copy result files
+    for ext in json csv; do
+        kubectl cp "${NAMESPACE}/${helper}:/results/${scenario}.${ext}" "${dest}/${scenario}.${ext}" 2>/dev/null || true
+    done
+
+    kubectl delete pod "${helper}" -n "${NAMESPACE}" --ignore-not-found 2>/dev/null || true
+    log "Results collected to ${dest}/${scenario}.{json,csv}"
 }
 
 # ── Scenario runner ───────────────────────────────────────────────────
@@ -118,8 +140,8 @@ run_guidellm_sweep() {
     export GUIDELLM_MAX_SECONDS
     apply_with_env "${SCRIPT_DIR}/guidellm-sweep.yaml"
 
-    # guidellm sweep + buffer time
-    local timeout=$(( GUIDELLM_MAX_SECONDS + 120 ))
+    # guidellm sweep: 10 strategies × max-seconds each + buffer
+    local timeout=$(( GUIDELLM_MAX_SECONDS * 10 + 300 ))
     wait_for_job "guidellm-sweep" "${timeout}"
     collect_results "${scenario}"
     cleanup_job "guidellm-sweep"
@@ -130,8 +152,13 @@ run_batch_submit() {
 
     cleanup_job "batch-submit"
 
-    export BATCH_SIZE
-    apply_with_env "${SCRIPT_DIR}/batch-submit.yaml"
+    # batch-submit.yaml uses a shell script body, so we cannot use envsubst
+    # (it would destroy $i, $JSONL_FILE, etc.). Instead, patch env var defaults via sed.
+    sed -e "s|http://batch-gateway-apiserver:8000|${BATCH_GATEWAY_URL}|" \
+        -e "s|Qwen/Qwen3-0.6B|${BATCH_MODEL}|" \
+        -e "s|value: \"100\"|value: \"${BATCH_SIZE}\"|" \
+        "${SCRIPT_DIR}/batch-submit.yaml" \
+        | kubectl apply -n "${NAMESPACE}" -f -
 }
 
 switch_processor_mode() {
