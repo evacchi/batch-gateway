@@ -197,10 +197,10 @@ def start_burst(cfg: ScenarioConfig):
     cycle_lines = []
     for c in range(1, cfg.cycles + 1):
         cycle_lines.extend([
-            f'echo "=== Cycle {c}: BURST ({cfg.burst_rate} req/s, {cfg.phase_seconds}s) ==="',
-            f'guidellm benchmark run --target "$T" $COMMON --profile constant --rate {cfg.burst_rate} --max-seconds {cfg.phase_seconds} --output-dir /results/{cfg.name} --outputs "burst-{c}.csv"',
-            f'echo "=== Cycle {c}: IDLE ({cfg.idle_rate} req/s, {cfg.phase_seconds}s) ==="',
-            f'guidellm benchmark run --target "$T" $COMMON --profile constant --rate {cfg.idle_rate} --max-seconds {cfg.phase_seconds} --output-dir /results/{cfg.name} --outputs "idle-{c}.csv"',
+            f'echo "=== Cycle {c}: BURST ({cfg.burst_rate} req/s, {cfg.burst_seconds}s) ==="',
+            f'guidellm benchmark run --target "$T" $COMMON --profile constant --rate {cfg.burst_rate} --max-seconds {cfg.burst_seconds} --output-dir /results/{cfg.name} --outputs "burst-{c}.csv"',
+            f'echo "=== Cycle {c}: IDLE ({cfg.idle_rate} req/s, {cfg.idle_seconds}s) ==="',
+            f'guidellm benchmark run --target "$T" $COMMON --profile constant --rate {cfg.idle_rate} --max-seconds {cfg.idle_seconds} --output-dir /results/{cfg.name} --outputs "idle-{c}.csv"',
         ])
 
     script_lines = [
@@ -343,7 +343,7 @@ def monitor_scenario(cfg: ScenarioConfig):
 
         if guidellm_done and batch_done:
             break
-        if elapsed > (cfg.cycles * cfg.phase_seconds * 2 + 300):
+        if elapsed > (cfg.cycles * (cfg.burst_seconds + cfg.idle_seconds) + 300):
             log(f"  [{cfg.name}] Timeout, stopping monitor")
             break
 
@@ -690,7 +690,8 @@ def main():
     parser.add_argument("--batch-size", type=int, default=50)
     parser.add_argument("--burst-rate", type=int, default=15)
     parser.add_argument("--idle-rate", type=int, default=1)
-    parser.add_argument("--phase-seconds", type=int, default=60)
+    parser.add_argument("--burst-seconds", type=int, default=60)
+    parser.add_argument("--idle-seconds", type=int, default=120)
     parser.add_argument("--cycles", type=int, default=2)
     parser.add_argument("--results-dir", type=Path, default=Path("./benchmark-results"))
     parser.add_argument("--target", default="http://llm-d-inference-gateway-istio")
@@ -702,20 +703,22 @@ def main():
     sync_cfg = ScenarioConfig(
         name="sync", namespace=args.sync_namespace, context=args.context,
         burst_rate=args.burst_rate, idle_rate=args.idle_rate,
-        phase_seconds=args.phase_seconds, cycles=args.cycles,
+        burst_seconds=args.burst_seconds, idle_seconds=args.idle_seconds,
+        cycles=args.cycles,
         batch_size=args.batch_size, target=args.target, model=args.model,
     )
     gated_cfg = ScenarioConfig(
         name="gated", namespace=args.gated_namespace, context=args.context,
         burst_rate=args.burst_rate, idle_rate=args.idle_rate,
-        phase_seconds=args.phase_seconds, cycles=args.cycles,
+        burst_seconds=args.burst_seconds, idle_seconds=args.idle_seconds,
+        cycles=args.cycles,
         batch_size=args.batch_size, target=args.target, model=args.model,
     )
 
     log("=== Starting benchmark ===")
-    log(f"Burst: {args.burst_rate} req/s, Idle: {args.idle_rate} req/s, "
-        f"{args.phase_seconds}s phases, {args.cycles} cycles, "
-        f"{args.batch_size} batch requests")
+    log(f"Burst: {args.burst_rate} req/s for {args.burst_seconds}s, "
+        f"Idle: {args.idle_rate} req/s for {args.idle_seconds}s, "
+        f"{args.cycles} cycles, {args.batch_size} batch requests")
 
     # Run scenarios sequentially (they use separate namespaces but share GPU nodes)
     log("━━━ Scenario 1: SYNC (no gate) ━━━")
