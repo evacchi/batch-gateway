@@ -84,7 +84,7 @@ def log(msg):
 def cleanup_namespace(context, namespace):
     log(f"Cleaning up {namespace}")
 
-    kubectl(["delete", "job", "guidellm-burst", "batch-submit",
+    kubectl(["delete", "job", "guidellm-burst", "batch-submit", "batch-submit-2",
              "--ignore-not-found"], context, namespace, check=False)
 
     kubectl(["scale", "deployment",
@@ -131,13 +131,13 @@ def cleanup_namespace(context, namespace):
     log(f"  Redis DBSIZE: {out}")
 
 
-def submit_batch(cfg: ScenarioConfig):
-    log(f"Submitting {cfg.batch_size}-request batch in {cfg.namespace}")
+def submit_batch(cfg: ScenarioConfig, job_name="batch-submit"):
+    log(f"Submitting {cfg.batch_size}-request batch ({job_name}) in {cfg.namespace}")
     yaml = textwrap.dedent(f"""\
     apiVersion: batch/v1
     kind: Job
     metadata:
-      name: batch-submit
+      name: {job_name}
     spec:
       backoffLimit: 0
       template:
@@ -197,10 +197,10 @@ def start_burst(cfg: ScenarioConfig):
     cycle_lines = []
     for c in range(1, cfg.cycles + 1):
         cycle_lines.extend([
-            f'echo "=== Cycle {c}: BURST ({cfg.burst_rate} req/s, {cfg.burst_seconds}s) ==="',
-            f'guidellm benchmark run --target "$T" $COMMON --profile constant --rate {cfg.burst_rate} --max-seconds {cfg.burst_seconds} --output-dir /results/{cfg.name} --outputs "burst-{c}.csv"',
             f'echo "=== Cycle {c}: IDLE ({cfg.idle_rate} req/s, {cfg.idle_seconds}s) ==="',
             f'guidellm benchmark run --target "$T" $COMMON --profile constant --rate {cfg.idle_rate} --max-seconds {cfg.idle_seconds} --output-dir /results/{cfg.name} --outputs "idle-{c}.csv"',
+            f'echo "=== Cycle {c}: BURST ({cfg.burst_rate} req/s, {cfg.burst_seconds}s) ==="',
+            f'guidellm benchmark run --target "$T" $COMMON --profile constant --rate {cfg.burst_rate} --max-seconds {cfg.burst_seconds} --output-dir /results/{cfg.name} --outputs "burst-{c}.csv"',
         ])
 
     script_lines = [
@@ -283,25 +283,40 @@ def poll_batch(cfg: ScenarioConfig):
     return timeline
 
 
+def _get_batch_progress(context, namespace, job_name):
+    """Get completed/total from a batch-submit job's logs."""
+    try:
+        out = kubectl(["logs", f"job/{job_name}", "--tail=5"],
+                     context, namespace, check=False)
+        for line in reversed(out.split("\n")):
+            if "completed=" in line and "/" in line.split("completed=")[1]:
+                parts = line.split("completed=")[1].split()[0].split("/")
+                return int(parts[0]), int(parts[1])
+    except Exception:
+        pass
+    return 0, 0
+
+
 def monitor_scenario(cfg: ScenarioConfig):
-    """Monitor batch progress during guidellm phases, return timeline."""
+    """Monitor batch progress during guidellm phases, return timeline.
+
+    Submits a second batch when the first BURST phase is detected, simulating
+    overlapping batch arrivals during traffic spikes.
+    """
     timeline = []
     start = time.time()
+    second_batch_submitted = False
+    batch_jobs = ["batch-submit"]
 
     while True:
         elapsed = time.time() - start
 
-        # Get batch progress
+        # Aggregate batch progress across all batch jobs
         completed, total = 0, 0
-        try:
-            out = kubectl(["logs", "job/batch-submit", "--tail=1"],
-                         cfg.context, cfg.namespace, check=False)
-            if "completed=" in out:
-                parts = out.split("completed=")[1].split()[0].split("/")
-                completed = int(parts[0])
-                total = int(parts[1])
-        except Exception:
-            pass
+        for job_name in batch_jobs:
+            c, t = _get_batch_progress(cfg.context, cfg.namespace, job_name)
+            completed += c
+            total += t
 
         # Get current phase
         phase = "unknown"
@@ -314,6 +329,13 @@ def monitor_scenario(cfg: ScenarioConfig):
         except Exception:
             pass
 
+        # Submit a second batch during the first burst
+        if not second_batch_submitted and "BURST" in phase:
+            log(f"  [{cfg.name}] Submitting overlapping batch during burst")
+            submit_batch(cfg, job_name="batch-submit-2")
+            batch_jobs.append("batch-submit-2")
+            second_batch_submitted = True
+
         timeline.append({
             "elapsed": round(elapsed),
             "completed": completed,
@@ -323,9 +345,8 @@ def monitor_scenario(cfg: ScenarioConfig):
 
         log(f"  [{cfg.name}] {phase} | batch: {completed}/{total}")
 
-        # Check if both jobs are done
+        # Check if guidellm is done
         guidellm_done = False
-        batch_done = False
         try:
             gs = kubectl(["get", "pods", "-l", "job-name=guidellm-burst",
                          "-o", "jsonpath={.items[0].status.phase}"],
@@ -333,13 +354,18 @@ def monitor_scenario(cfg: ScenarioConfig):
             guidellm_done = gs in ("Succeeded", "Failed")
         except Exception:
             pass
-        try:
-            bs = kubectl(["get", "pods", "-l", "job-name=batch-submit",
-                         "-o", "jsonpath={.items[0].status.phase}"],
-                        cfg.context, cfg.namespace, check=False)
-            batch_done = bs in ("Succeeded", "Failed")
-        except Exception:
-            pass
+
+        # Check if all batch jobs are done
+        batch_done = True
+        for job_name in batch_jobs:
+            try:
+                bs = kubectl(["get", "pods", "-l", f"job-name={job_name}",
+                             "-o", "jsonpath={.items[0].status.phase}"],
+                            cfg.context, cfg.namespace, check=False)
+                if bs not in ("Succeeded", "Failed"):
+                    batch_done = False
+            except Exception:
+                pass
 
         if guidellm_done and batch_done:
             break
@@ -686,7 +712,7 @@ def main():
     parser = argparse.ArgumentParser(description="Batch vs Live Traffic Benchmark")
     parser.add_argument("--context", required=True, help="kubectl context")
     parser.add_argument("--sync-namespace", required=True, help="Namespace for sync scenario")
-    parser.add_argument("--gated-namespace", required=True, help="Namespace for gated scenario")
+    parser.add_argument("--gated-namespace", default="", help="Namespace for gated scenario (omit to skip)")
     parser.add_argument("--batch-size", type=int, default=50)
     parser.add_argument("--burst-rate", type=int, default=15)
     parser.add_argument("--idle-rate", type=int, default=1)
@@ -707,13 +733,15 @@ def main():
         cycles=args.cycles,
         batch_size=args.batch_size, target=args.target, model=args.model,
     )
-    gated_cfg = ScenarioConfig(
-        name="gated", namespace=args.gated_namespace, context=args.context,
-        burst_rate=args.burst_rate, idle_rate=args.idle_rate,
-        burst_seconds=args.burst_seconds, idle_seconds=args.idle_seconds,
-        cycles=args.cycles,
-        batch_size=args.batch_size, target=args.target, model=args.model,
-    )
+    gated_cfg = None
+    if args.gated_namespace:
+        gated_cfg = ScenarioConfig(
+            name="gated", namespace=args.gated_namespace, context=args.context,
+            burst_rate=args.burst_rate, idle_rate=args.idle_rate,
+            burst_seconds=args.burst_seconds, idle_seconds=args.idle_seconds,
+            cycles=args.cycles,
+            batch_size=args.batch_size, target=args.target, model=args.model,
+        )
 
     log("=== Starting benchmark ===")
     log(f"Burst: {args.burst_rate} req/s for {args.burst_seconds}s, "
@@ -724,12 +752,17 @@ def main():
     log("━━━ Scenario 1: SYNC (no gate) ━━━")
     sync_timeline, sync_csvs = run_scenario(sync_cfg, args.results_dir)
 
-    log("━━━ Scenario 2: GATED (prometheus-budget gate) ━━━")
-    gated_timeline, gated_csvs = run_scenario(gated_cfg, args.results_dir)
+    gated_timeline, gated_csvs = [], []
+    if gated_cfg:
+        log("━━━ Scenario 2: GATED (prometheus-budget gate) ━━━")
+        gated_timeline, gated_csvs = run_scenario(gated_cfg, args.results_dir)
+    else:
+        log("━━━ Skipping gated scenario (no --gated-namespace) ━━━")
 
     # Save timelines as JSON
     (args.results_dir / "sync-timeline.json").write_text(json.dumps(sync_timeline, indent=2))
-    (args.results_dir / "gated-timeline.json").write_text(json.dumps(gated_timeline, indent=2))
+    if gated_timeline:
+        (args.results_dir / "gated-timeline.json").write_text(json.dumps(gated_timeline, indent=2))
 
     # Generate HTML report
     report = generate_html_report(args.results_dir, sync_timeline, gated_timeline,

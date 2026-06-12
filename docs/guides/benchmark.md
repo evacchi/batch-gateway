@@ -95,11 +95,15 @@ helm install ${GUIDE_NAME} \
     -f ${LLM_D_REPO}/guides/recipes/router/base.values.yaml \
     -f ${LLM_D_REPO}/guides/${GUIDE_NAME}/router/${GUIDE_NAME}.values.yaml \
     -f ${LLM_D_REPO}/guides/recipes/router/features/monitoring.values.yaml \
-    --set router.inferencePool.gatewayRef.name=llm-d-inference-gateway \
+    --set provider.name=istio \
     --set httpRoute.create=true \
     --set httpRoute.inferenceGatewayName=llm-d-inference-gateway \
     -n ${NAMESPACE}
 ```
+
+> **Note:** `--set provider.name=istio` is required — it creates a DestinationRule
+> that allows the Istio gateway proxy to reach the EPP's ext-proc gRPC service.
+> Without it, requests will fail with 500 errors.
 
 ## Step 6: Deploy vLLM model server (Qwen/Qwen3-0.6B)
 
