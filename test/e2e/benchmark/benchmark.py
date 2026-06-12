@@ -33,7 +33,8 @@ class ScenarioConfig:
     context: str
     burst_rate: int
     idle_rate: int
-    phase_seconds: int
+    burst_seconds: int
+    idle_seconds: int
     cycles: int
     batch_size: int
     target: str = "http://llm-d-inference-gateway-istio"
@@ -191,57 +192,58 @@ def submit_batch(cfg: ScenarioConfig):
 
 def start_burst(cfg: ScenarioConfig):
     log(f"Starting burst pattern in {cfg.namespace}: {cfg.cycles} cycles, "
-        f"burst@{cfg.burst_rate}/s idle@{cfg.idle_rate}/s, {cfg.phase_seconds}s each")
+        f"burst@{cfg.burst_rate}/s for {cfg.burst_seconds}s, idle@{cfg.idle_rate}/s for {cfg.idle_seconds}s")
 
-    cycle_cmds = []
+    cycle_lines = []
     for c in range(1, cfg.cycles + 1):
-        cycle_cmds.append(f"""\
-                echo "=== Cycle {c}: BURST ({cfg.burst_rate} req/s, {cfg.phase_seconds}s) ==="
-                guidellm benchmark run --target "$T" $COMMON --profile constant --rate {cfg.burst_rate} --max-seconds {cfg.phase_seconds} --output-dir /results/{cfg.name} --outputs "burst-{c}.csv"
-                echo "=== Cycle {c}: IDLE ({cfg.idle_rate} req/s, {cfg.phase_seconds}s) ==="
-                guidellm benchmark run --target "$T" $COMMON --profile constant --rate {cfg.idle_rate} --max-seconds {cfg.phase_seconds} --output-dir /results/{cfg.name} --outputs "idle-{c}.csv"
-""")
+        cycle_lines.extend([
+            f'echo "=== Cycle {c}: BURST ({cfg.burst_rate} req/s, {cfg.phase_seconds}s) ==="',
+            f'guidellm benchmark run --target "$T" $COMMON --profile constant --rate {cfg.burst_rate} --max-seconds {cfg.phase_seconds} --output-dir /results/{cfg.name} --outputs "burst-{c}.csv"',
+            f'echo "=== Cycle {c}: IDLE ({cfg.idle_rate} req/s, {cfg.phase_seconds}s) ==="',
+            f'guidellm benchmark run --target "$T" $COMMON --profile constant --rate {cfg.idle_rate} --max-seconds {cfg.phase_seconds} --output-dir /results/{cfg.name} --outputs "idle-{c}.csv"',
+        ])
 
-    script = (
-        f'T="{cfg.target}"\n'
-        f'M="{cfg.model}"\n'
-        'COMMON="--request-format text_completions --model $M '
-        '--data prompt_tokens=256,output_tokens=128 --processor $M '
-        '--disable-console-interactive"\n'
-        f'mkdir -p /results/{cfg.name}\n'
-    ) + "\n".join(cycle_cmds) + 'echo "=== Done ==="\n'
+    script_lines = [
+        f'T="{cfg.target}"',
+        f'M="{cfg.model}"',
+        'COMMON="--request-format text_completions --model $M --data prompt_tokens=256,output_tokens=128 --processor $M --disable-console-interactive"',
+        f'mkdir -p /results/{cfg.name}',
+    ] + cycle_lines + ['echo "=== Done ==="']
 
-    yaml = textwrap.dedent(f"""\
-    apiVersion: batch/v1
-    kind: Job
-    metadata:
-      name: guidellm-burst
+    indent = " " * 14
+    script_block = "\n".join(indent + line for line in script_lines)
+
+    yaml = f"""\
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: guidellm-burst
+spec:
+  backoffLimit: 0
+  template:
     spec:
-      backoffLimit: 0
-      template:
-        spec:
-          restartPolicy: Never
-          containers:
-            - name: guidellm
-              image: ghcr.io/vllm-project/guidellm:latest
-              env:
-                - name: USER
-                  value: "guidellm"
-                - name: HF_HUB_CACHE
-                  value: "/tmp/hf_cache"
-              command:
-                - sh
-                - -c
-                - |
-    """) + textwrap.indent(script, " " * 18) + textwrap.dedent("""\
-              volumeMounts:
-                - name: results
-                  mountPath: /results
-          volumes:
+      restartPolicy: Never
+      containers:
+        - name: guidellm
+          image: ghcr.io/vllm-project/guidellm:latest
+          env:
+            - name: USER
+              value: "guidellm"
+            - name: HF_HUB_CACHE
+              value: "/tmp/hf_cache"
+          command:
+            - sh
+            - -c
+            - |
+{script_block}
+          volumeMounts:
             - name: results
-              persistentVolumeClaim:
-                claimName: benchmark-results
-    """)
+              mountPath: /results
+      volumes:
+        - name: results
+          persistentVolumeClaim:
+            claimName: benchmark-results
+"""
     kubectl_apply(yaml, cfg.context, cfg.namespace)
 
 
