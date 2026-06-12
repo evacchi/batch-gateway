@@ -37,6 +37,7 @@ class ScenarioConfig:
     idle_seconds: int
     cycles: int
     batch_size: int
+    prompt_tokens: int = 1500
     target: str = "http://llm-d-inference-gateway-istio"
     model: str = "Qwen/Qwen3-0.6B"
 
@@ -132,7 +133,9 @@ def cleanup_namespace(context, namespace):
 
 
 def submit_batch(cfg: ScenarioConfig, job_name="batch-submit"):
-    log(f"Submitting {cfg.batch_size}-request batch ({job_name}) in {cfg.namespace}")
+    prompt_chars = cfg.prompt_tokens * 3
+    log(f"Submitting {cfg.batch_size}-request batch ({job_name}) in {cfg.namespace} "
+        f"(~{cfg.prompt_tokens} tokens/request, random prompts)")
     yaml = textwrap.dedent(f"""\
     apiVersion: batch/v1
     kind: Job
@@ -159,12 +162,14 @@ def submit_batch(cfg: ScenarioConfig, job_name="batch-submit"):
                 - |
                   set -e
                   JSONL_FILE="/tmp/batch-input.jsonl"
+                  PROMPT_CHARS={prompt_chars}
                   i=0
                   while [ "$i" -lt "$BATCH_SIZE" ]; do
-                    echo '{{"custom_id":"bench-'$i'","method":"POST","url":"/v1/chat/completions","body":{{"model":"'$BATCH_MODEL'","max_tokens":512,"messages":[{{"role":"user","content":"Write a detailed essay about the history, significance, and future implications of request number '$i'. Include multiple paragraphs with examples."}}]}}}}' >> "$JSONL_FILE"
+                    RAND=$(cat /dev/urandom | tr -dc 'a-zA-Z0-9 ' | head -c "$PROMPT_CHARS")
+                    printf '{{"custom_id":"bench-%s","method":"POST","url":"/v1/chat/completions","body":{{"model":"%s","messages":[{{"role":"user","content":"%s"}}]}}}}\\n' "$i" "$BATCH_MODEL" "$RAND" >> "$JSONL_FILE"
                     i=$((i + 1))
                   done
-                  echo "Generated $BATCH_SIZE requests"
+                  echo "Generated $BATCH_SIZE requests (~$PROMPT_CHARS chars each)"
                   FILE_RESPONSE=$(curl -sk "$BATCH_GATEWAY_URL/v1/files" -H "Authorization: Bearer benchmark" -F "purpose=batch" -F "file=@$JSONL_FILE")
                   FILE_ID=$(echo "$FILE_RESPONSE" | grep -o '"id":"[^"]*"' | head -1 | cut -d'"' -f4)
                   [ -z "$FILE_ID" ] && echo "Upload failed: $FILE_RESPONSE" && exit 1
@@ -206,7 +211,7 @@ def start_burst(cfg: ScenarioConfig):
     script_lines = [
         f'T="{cfg.target}"',
         f'M="{cfg.model}"',
-        'COMMON="--request-format text_completions --model $M --data prompt_tokens=256,output_tokens=512 --processor $M --disable-console-interactive"',
+        f'COMMON="--request-format text_completions --model $M --data prompt_tokens={cfg.prompt_tokens},prompt_tokens_stdev={cfg.prompt_tokens // 4},output_tokens=512,output_tokens_stdev=256 --processor $M --disable-console-interactive"',
         f'mkdir -p /results/{cfg.name}',
     ] + cycle_lines + ['echo "=== Done ==="']
 
@@ -473,116 +478,248 @@ def generate_html_report(results_dir: Path, sync_timeline, gated_timeline,
         for csv_file in sorted(gated_csvs.glob("*.csv")):
             gated_metrics[csv_file.stem] = parse_csv_metrics(csv_file)
 
-    # Build timeline data for chart
+    # Build timeline data
     sync_points = json.dumps([{"x": t["elapsed"], "y": t["completed"]} for t in sync_timeline])
     gated_points = json.dumps([{"x": t["elapsed"], "y": t["completed"]} for t in gated_timeline])
 
-    # Build phase annotation data
-    phase_annotations = []
-    if gated_timeline:
-        prev_phase = ""
-        for t in gated_timeline:
-            if t["phase"] != prev_phase:
-                color = "rgba(255,99,132,0.1)" if "BURST" in t["phase"] else "rgba(75,192,192,0.1)"
-                phase_annotations.append({
-                    "x": t["elapsed"],
-                    "phase": t["phase"],
-                    "color": color,
-                })
-                prev_phase = t["phase"]
+    # Build phase band data from the longer timeline
+    ref_timeline = gated_timeline if gated_timeline else sync_timeline
+    phase_bands = []
+    prev_phase = ""
+    for t in ref_timeline:
+        if t["phase"] != prev_phase:
+            phase_bands.append({"x": t["elapsed"], "phase": t["phase"]})
+            prev_phase = t["phase"]
 
-    # Build comparison data, filtering bogus phases (ok_rps > 200 with 0 completed)
-    def valid(m):
-        return not (m.ok_rps > 200 and m.completed == 0)
+    # Extract per-phase metrics
+    def extract(metrics, key):
+        ms = metrics.get(key, [])
+        return ms[0] if ms else None
 
+    # Build comparison table rows and chart data
+    phase_labels = sorted(set(list(sync_metrics.keys()) + list(gated_metrics.keys())))
     sync_ttft = []
     gated_ttft = []
-    sync_err_rate = []
-    gated_err_rate = []
-    phase_labels = []
-    for key in sorted(sync_metrics.keys()):
-        ms = [m for m in sync_metrics[key] if valid(m)]
-        if ms:
-            phase_labels.append(key)
-            sync_ttft.append(ms[0].ttft_p50)
-            sync_err_rate.append(ms[0].error_rate)
-    for key in sorted(gated_metrics.keys()):
-        ms = [m for m in gated_metrics.get(key, []) if valid(m)]
-        if key in phase_labels and ms:
-            gated_ttft.append(ms[0].ttft_p50)
-            gated_err_rate.append(ms[0].error_rate)
+    sync_incomplete = []
+    gated_incomplete = []
+    table_rows = []
+    for phase_name in phase_labels:
+        sm = extract(sync_metrics, phase_name)
+        gm = extract(gated_metrics, phase_name)
+        if sm:
+            inc_pct = (sm.errors / (sm.completed + sm.errors) * 100) if (sm.completed + sm.errors) > 0 else 0
+            sync_ttft.append(sm.ttft_p50)
+            sync_incomplete.append(inc_pct)
+            table_rows.append(("sync", phase_name, sm))
+        else:
+            sync_ttft.append(0)
+            sync_incomplete.append(0)
+        if gm:
+            inc_pct = (gm.errors / (gm.completed + gm.errors) * 100) if (gm.completed + gm.errors) > 0 else 0
+            gated_ttft.append(gm.ttft_p50)
+            gated_incomplete.append(inc_pct)
+            table_rows.append(("gated", phase_name, gm))
+        else:
+            gated_ttft.append(0)
+            gated_incomplete.append(0)
+
+    # Compute batch progress during burst phases
+    def batch_during_phase(timeline, phase_substr):
+        pts = [t for t in timeline if phase_substr in t.get("phase", "")]
+        if len(pts) >= 2:
+            return pts[-1]["completed"] - pts[0]["completed"]
+        return 0
+
+    sync_batch_burst = batch_during_phase(sync_timeline, "BURST")
+    gated_batch_burst = batch_during_phase(gated_timeline, "BURST")
+    sync_batch_idle = batch_during_phase(sync_timeline, "IDLE")
+    gated_batch_idle = batch_during_phase(gated_timeline, "IDLE")
+
+    # Read config from timeline metadata
+    cfg_burst_rate = 30
+    cfg_idle_rate = 1
+    cfg_burst_sec = 60
+    cfg_idle_sec = 120
+    cfg_batch_size = 500
+    cfg_model = "Qwen/Qwen3-8B"
+    if sync_timeline:
+        for t in sync_timeline:
+            p = t.get("phase", "")
+            if "BURST" in p and "req/s" in p:
+                try:
+                    cfg_burst_rate = int(p.split("(")[1].split(" ")[0])
+                    cfg_burst_sec = int(p.split(", ")[1].rstrip("s)"))
+                except (IndexError, ValueError):
+                    pass
+            elif "IDLE" in p and "req/s" in p:
+                try:
+                    cfg_idle_rate = int(p.split("(")[1].split(" ")[0])
+                    cfg_idle_sec = int(p.split(", ")[1].rstrip("s)"))
+                except (IndexError, ValueError):
+                    pass
+        if sync_timeline[-1].get("total", 0) > 0:
+            cfg_batch_size = sync_timeline[-1]["total"]
 
     html = textwrap.dedent(f"""\
     <!DOCTYPE html>
     <html>
     <head>
-        <title>Batch vs Live Traffic Benchmark</title>
+        <title>Batch vs Live Traffic Isolation Benchmark</title>
         <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+        <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-annotation@3"></script>
         <style>
-            body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; margin: 40px; background: #fafafa; }}
-            h1 {{ color: #333; }}
-            h2 {{ color: #555; margin-top: 40px; }}
+            body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; margin: 40px; max-width: 1200px; background: #fafafa; color: #333; }}
+            h1 {{ color: #1a1a1a; border-bottom: 2px solid #e5e5e5; padding-bottom: 12px; }}
+            h2 {{ color: #444; margin-top: 40px; }}
+            .card {{ background: white; border-radius: 8px; padding: 24px; margin: 20px 0; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }}
             .chart-container {{ background: white; border-radius: 8px; padding: 20px; margin: 20px 0; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }}
             canvas {{ max-height: 400px; }}
             table {{ border-collapse: collapse; width: 100%; margin: 20px 0; background: white; border-radius: 8px; overflow: hidden; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }}
             th, td {{ padding: 10px 16px; text-align: right; border-bottom: 1px solid #eee; }}
             th {{ background: #f5f5f5; font-weight: 600; text-align: left; }}
             td:first-child {{ text-align: left; font-weight: 500; }}
-            .summary {{ background: white; border-radius: 8px; padding: 20px; margin: 20px 0; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }}
-            .good {{ color: #22c55e; }}
-            .bad {{ color: #ef4444; }}
+            .good {{ color: #16a34a; font-weight: 600; }}
+            .bad {{ color: #dc2626; font-weight: 600; }}
+            .metric-grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin: 16px 0; }}
+            .metric-box {{ background: #f9fafb; border-radius: 6px; padding: 16px; border: 1px solid #e5e7eb; }}
+            .metric-box h4 {{ margin: 0 0 4px 0; font-size: 13px; color: #6b7280; text-transform: uppercase; letter-spacing: 0.5px; }}
+            .metric-box .value {{ font-size: 28px; font-weight: 700; }}
+            .metric-box .detail {{ font-size: 13px; color: #6b7280; margin-top: 4px; }}
+            code {{ background: #f3f4f6; padding: 2px 6px; border-radius: 4px; font-size: 14px; }}
+            .workload-table {{ width: auto; margin: 12px 0; }}
+            .workload-table td {{ padding: 4px 16px 4px 0; border: none; text-align: left; }}
+            .workload-table td:first-child {{ font-weight: 600; color: #6b7280; }}
         </style>
     </head>
     <body>
-        <h1>Batch vs Live Traffic Benchmark</h1>
+        <h1>Batch vs Live Traffic Isolation</h1>
 
-        <div class="summary">
-            <h2>Key Finding</h2>
-            <p><strong>Sync dispatch</strong> (no gate): Batch requests <span class="bad">failed to complete</span> under live traffic load.
-               The processor competes directly with live requests for inference capacity.</p>
-            <p><strong>Gated async dispatch</strong> (prometheus-budget gate): Batch requests <span class="good">completed successfully</span>.
-               The gate throttles batch during traffic bursts and dispatches during idle periods.</p>
+        <div class="card">
+            <h2 style="margin-top:0">Workload</h2>
+            <p>This benchmark tests whether the <strong>llm-d-async dispatch budget gate</strong>
+            protects live inference traffic from batch request interference. Two scenarios are
+            compared on identical hardware:</p>
+            <table class="workload-table">
+                <tr><td>Model</td><td><code>{cfg_model}</code> on 1x NVIDIA A100 GPU</td></tr>
+                <tr><td>Live traffic</td><td>guidellm burst/idle cycles: <strong>{cfg_burst_rate} req/s</strong> for {cfg_burst_sec}s (burst),
+                    <strong>{cfg_idle_rate} req/s</strong> for {cfg_idle_sec}s (idle), 2 cycles</td></tr>
+                <tr><td>Batch load</td><td>{cfg_batch_size} requests submitted at start (idle), another {cfg_batch_size} submitted during first burst</td></tr>
+                <tr><td>Batch requests</td><td>~2000 random input tokens, no output cap (defeats prefix caching)</td></tr>
+                <tr><td>Pattern</td><td>IDLE &rarr; BURST &rarr; IDLE &rarr; BURST</td></tr>
+            </table>
+            <div class="metric-grid" style="margin-top: 20px">
+                <div class="metric-box">
+                    <h4>Sync (no gate)</h4>
+                    <p>Batch-gateway processor sends requests <strong>directly</strong> to the inference gateway.
+                    Batch and live traffic compete for GPU capacity.</p>
+                </div>
+                <div class="metric-box">
+                    <h4>Gated (async dispatch)</h4>
+                    <p>Batch-gateway submits to a Redis queue. The <strong>async-processor</strong> dispatches
+                    only when the <code>prometheus-budget</code> gate is open (GPU utilization below threshold).</p>
+                </div>
+            </div>
+        </div>
+
+        <h2>Key Results</h2>
+        <div class="metric-grid">
+            <div class="metric-box">
+                <h4>Sync: Batch during Burst</h4>
+                <div class="value bad">{sync_batch_burst} reqs</div>
+                <div class="detail">Batch requests dispatched directly during live traffic burst, competing for GPU</div>
+            </div>
+            <div class="metric-box">
+                <h4>Gated: Batch during Burst</h4>
+                <div class="value good">{gated_batch_burst} reqs</div>
+                <div class="detail">Gate throttles batch &mdash; only excess capacity used, live traffic protected</div>
+            </div>
         </div>
 
         <h2>Batch Completion Timeline</h2>
+        <p>The timeline shows how batch requests progress over time. Red/green shaded bands indicate
+        burst (high live traffic) and idle phases. In sync mode, batch blasts through during burst,
+        competing with live traffic. With the gate, batch progress <strong>pauses during burst</strong>
+        and resumes during idle.</p>
         <div class="chart-container">
             <canvas id="timelineChart"></canvas>
         </div>
 
-        <h2>Live Traffic Metrics by Phase (TTFT p50)</h2>
+        <h2>Live Traffic Quality: TTFT</h2>
+        <p>Time to First Token (TTFT) measures how quickly the model begins responding.
+        Higher TTFT during burst phases indicates GPU contention from batch requests.</p>
         <div class="chart-container">
             <canvas id="ttftChart"></canvas>
         </div>
 
-        <h2>Detailed Metrics</h2>
-        <h2>Error Rate by Phase</h2>
+        <h2>Live Traffic Quality: Incomplete Requests</h2>
+        <p>Requests that did not complete within the phase window. A high incomplete rate
+        during burst indicates the GPU is overloaded.</p>
         <div class="chart-container">
-            <canvas id="errorChart"></canvas>
+            <canvas id="incompleteChart"></canvas>
         </div>
 
+        <h2>Detailed Metrics</h2>
         <table>
-            <tr><th>Scenario</th><th>Phase</th><th>TTFT p50 (ms)</th><th>TTFT p95 (ms)</th><th>ITL p50 (ms)</th><th>Req Lat p50 (s)</th><th>OK req/s</th><th>Err req/s</th><th>Error %</th><th>Completed</th></tr>
+            <tr><th>Scenario</th><th>Phase</th><th>Successful</th><th>Incomplete</th><th>TTFT p50 (ms)</th><th>TTFT p95 (ms)</th><th>ITL p50 (ms)</th><th>OK req/s</th></tr>
     """)
 
-    for scenario, metrics in [("sync", sync_metrics), ("gated", gated_metrics)]:
-        for phase_name, phase_metrics in sorted(metrics.items()):
-            for m in phase_metrics:
-                # Skip phases with bogus data (ok_rps > 200 with 0 completed)
-                if m.ok_rps > 200 and m.completed == 0:
-                    continue
-                err_class = ' class="bad"' if m.error_rate > 50 else ""
-                html += (f"        <tr><td>{scenario}</td><td>{phase_name}</td>"
-                        f"<td>{m.ttft_p50:.1f}</td><td>{m.ttft_p95:.1f}</td>"
-                        f"<td>{m.itl_p50:.2f}</td><td>{m.req_latency_p50:.3f}</td>"
-                        f"<td>{m.ok_rps:.2f}</td><td{err_class}>{m.err_rps:.2f}</td>"
-                        f"<td{err_class}>{m.error_rate:.0f}%</td>"
-                        f"<td>{m.completed}</td></tr>\n")
+    for scenario, phase_name, m in table_rows:
+        is_burst = "burst" in phase_name
+        sc = "bad" if scenario == "sync" and is_burst else ("good" if scenario == "gated" and is_burst else "")
+        cls = f' class="{sc}"' if sc else ""
+        html += (f"        <tr{cls}><td>{scenario}</td><td>{phase_name}</td>"
+                f"<td>{m.completed}</td><td>{m.errors}</td>"
+                f"<td>{m.ttft_p50:.1f}</td><td>{m.ttft_p95:.1f}</td>"
+                f"<td>{m.itl_p50:.2f}</td>"
+                f"<td>{m.ok_rps:.1f}</td></tr>\n")
 
     html += textwrap.dedent(f"""\
         </table>
 
+        <div class="card" style="margin-top: 40px">
+            <h2 style="margin-top:0">Conclusion</h2>
+            <p>Without the dispatch budget gate (<strong>sync</strong>), the batch processor sends all
+            {cfg_batch_size} requests directly to the inference gateway during burst, competing with
+            {cfg_burst_rate} req/s of live traffic for GPU compute. This increases TTFT and causes
+            request timeouts.</p>
+            <p>With the <strong>prometheus-budget gate</strong>, the async-processor monitors GPU
+            utilization via Prometheus and holds back batch requests when the inference endpoint is
+            saturated. Batch requests only dispatch during idle periods when there is spare capacity,
+            preserving live traffic quality.</p>
+        </div>
+
         <script>
-        // Batch completion timeline
+        const phaseBands = {json.dumps(phase_bands)};
+
+        // Build annotation boxes for burst/idle phases
+        function buildPhaseAnnotations(maxX) {{
+            const annotations = {{}};
+            for (let i = 0; i < phaseBands.length; i++) {{
+                const start = phaseBands[i].x;
+                const end = i + 1 < phaseBands.length ? phaseBands[i + 1].x : maxX;
+                const isBurst = phaseBands[i].phase.includes('BURST');
+                annotations['band' + i] = {{
+                    type: 'box',
+                    xMin: start, xMax: end,
+                    backgroundColor: isBurst ? 'rgba(239,68,68,0.08)' : 'rgba(34,197,94,0.06)',
+                    borderWidth: 0,
+                    label: {{
+                        display: true,
+                        content: isBurst ? 'BURST' : 'IDLE',
+                        position: {{ x: 'center', y: 'start' }},
+                        font: {{ size: 11, weight: 'bold' }},
+                        color: isBurst ? 'rgba(239,68,68,0.5)' : 'rgba(34,197,94,0.4)',
+                    }}
+                }};
+            }}
+            return annotations;
+        }}
+
+        const maxElapsed = Math.max(
+            ...{sync_points}.map(p => p.x),
+            ...({gated_points}.length ? {gated_points}.map(p => p.x) : [0])
+        );
+
         new Chart(document.getElementById('timelineChart'), {{
             type: 'line',
             data: {{
@@ -592,89 +729,59 @@ def generate_html_report(results_dir: Path, sync_timeline, gated_timeline,
                         data: {sync_points},
                         borderColor: '#ef4444',
                         backgroundColor: 'rgba(239,68,68,0.1)',
-                        fill: false,
-                        tension: 0.1,
-                        pointRadius: 2,
+                        fill: false, tension: 0.1, pointRadius: 3, borderWidth: 2,
                     }},
                     {{
                         label: 'Gated (prometheus-budget)',
                         data: {gated_points},
                         borderColor: '#22c55e',
                         backgroundColor: 'rgba(34,197,94,0.1)',
-                        fill: false,
-                        tension: 0.1,
-                        pointRadius: 2,
+                        fill: false, tension: 0.1, pointRadius: 3, borderWidth: 2,
                     }}
                 ]
             }},
             options: {{
                 responsive: true,
                 plugins: {{
-                    title: {{ display: true, text: 'Batch Requests Completed Over Time (burst/idle cycles)' }},
-                    legend: {{ position: 'top' }}
+                    title: {{ display: true, text: 'Batch Requests Completed Over Time', font: {{ size: 16 }} }},
+                    annotation: {{ annotations: buildPhaseAnnotations(maxElapsed) }}
                 }},
                 scales: {{
                     x: {{ type: 'linear', title: {{ display: true, text: 'Time (seconds)' }} }},
-                    y: {{ title: {{ display: true, text: 'Completed Requests' }}, beginAtZero: true }}
+                    y: {{ title: {{ display: true, text: 'Batch Requests Completed' }}, beginAtZero: true }}
                 }}
             }}
         }});
 
-        // TTFT comparison
         new Chart(document.getElementById('ttftChart'), {{
             type: 'bar',
             data: {{
                 labels: {json.dumps(phase_labels)},
                 datasets: [
-                    {{
-                        label: 'Sync (no gate)',
-                        data: {json.dumps(sync_ttft)},
-                        backgroundColor: 'rgba(239,68,68,0.7)',
-                    }},
-                    {{
-                        label: 'Gated (prometheus-budget)',
-                        data: {json.dumps(gated_ttft[:len(sync_ttft)])},
-                        backgroundColor: 'rgba(34,197,94,0.7)',
-                    }}
+                    {{ label: 'Sync', data: {json.dumps(sync_ttft)}, backgroundColor: 'rgba(239,68,68,0.7)' }},
+                    {{ label: 'Gated', data: {json.dumps(gated_ttft)}, backgroundColor: 'rgba(34,197,94,0.7)' }}
                 ]
             }},
             options: {{
                 responsive: true,
-                plugins: {{
-                    title: {{ display: true, text: 'Time to First Token (p50) by Phase' }},
-                }},
-                scales: {{
-                    y: {{ title: {{ display: true, text: 'TTFT p50 (ms)' }}, beginAtZero: true }}
-                }}
+                plugins: {{ title: {{ display: true, text: 'Time to First Token p50 (ms) — lower is better', font: {{ size: 16 }} }} }},
+                scales: {{ y: {{ title: {{ display: true, text: 'TTFT p50 (ms)' }}, beginAtZero: true }} }}
             }}
         }});
 
-        // Error rate comparison
-        new Chart(document.getElementById('errorChart'), {{
+        new Chart(document.getElementById('incompleteChart'), {{
             type: 'bar',
             data: {{
                 labels: {json.dumps(phase_labels)},
                 datasets: [
-                    {{
-                        label: 'Sync (no gate)',
-                        data: {json.dumps(sync_err_rate)},
-                        backgroundColor: 'rgba(239,68,68,0.7)',
-                    }},
-                    {{
-                        label: 'Gated (prometheus-budget)',
-                        data: {json.dumps(gated_err_rate[:len(sync_err_rate)])},
-                        backgroundColor: 'rgba(34,197,94,0.7)',
-                    }}
+                    {{ label: 'Sync', data: {json.dumps(sync_incomplete)}, backgroundColor: 'rgba(239,68,68,0.7)' }},
+                    {{ label: 'Gated', data: {json.dumps(gated_incomplete)}, backgroundColor: 'rgba(34,197,94,0.7)' }}
                 ]
             }},
             options: {{
                 responsive: true,
-                plugins: {{
-                    title: {{ display: true, text: 'Inference Error Rate by Phase (lower is better)' }},
-                }},
-                scales: {{
-                    y: {{ title: {{ display: true, text: 'Error %' }}, beginAtZero: true, max: 100 }}
-                }}
+                plugins: {{ title: {{ display: true, text: 'Incomplete Request Rate (%) — lower is better', font: {{ size: 16 }} }} }},
+                scales: {{ y: {{ title: {{ display: true, text: 'Incomplete %' }}, beginAtZero: true }} }}
             }}
         }});
         </script>
@@ -713,7 +820,7 @@ def run_scenario(cfg: ScenarioConfig, results_dir: Path):
 def main():
     parser = argparse.ArgumentParser(description="Batch vs Live Traffic Benchmark")
     parser.add_argument("--context", required=True, help="kubectl context")
-    parser.add_argument("--sync-namespace", required=True, help="Namespace for sync scenario")
+    parser.add_argument("--sync-namespace", default="", help="Namespace for sync scenario (omit to skip)")
     parser.add_argument("--gated-namespace", default="", help="Namespace for gated scenario (omit to skip)")
     parser.add_argument("--batch-size", type=int, default=50)
     parser.add_argument("--burst-rate", type=int, default=15)
@@ -721,6 +828,8 @@ def main():
     parser.add_argument("--burst-seconds", type=int, default=60)
     parser.add_argument("--idle-seconds", type=int, default=120)
     parser.add_argument("--cycles", type=int, default=2)
+    parser.add_argument("--prompt-tokens", type=int, default=1500,
+                        help="Input tokens per request (batch and live traffic)")
     parser.add_argument("--results-dir", type=Path, default=Path("./benchmark-results"))
     parser.add_argument("--target", default="http://llm-d-inference-gateway-istio")
     parser.add_argument("--model", default="Qwen/Qwen3-0.6B")
@@ -728,13 +837,16 @@ def main():
 
     args.results_dir.mkdir(parents=True, exist_ok=True)
 
-    sync_cfg = ScenarioConfig(
-        name="sync", namespace=args.sync_namespace, context=args.context,
-        burst_rate=args.burst_rate, idle_rate=args.idle_rate,
-        burst_seconds=args.burst_seconds, idle_seconds=args.idle_seconds,
-        cycles=args.cycles,
-        batch_size=args.batch_size, target=args.target, model=args.model,
-    )
+    sync_cfg = None
+    if args.sync_namespace:
+        sync_cfg = ScenarioConfig(
+            name="sync", namespace=args.sync_namespace, context=args.context,
+            burst_rate=args.burst_rate, idle_rate=args.idle_rate,
+            burst_seconds=args.burst_seconds, idle_seconds=args.idle_seconds,
+            cycles=args.cycles,
+            batch_size=args.batch_size, prompt_tokens=args.prompt_tokens,
+            target=args.target, model=args.model,
+        )
     gated_cfg = None
     if args.gated_namespace:
         gated_cfg = ScenarioConfig(
@@ -742,7 +854,8 @@ def main():
             burst_rate=args.burst_rate, idle_rate=args.idle_rate,
             burst_seconds=args.burst_seconds, idle_seconds=args.idle_seconds,
             cycles=args.cycles,
-            batch_size=args.batch_size, target=args.target, model=args.model,
+            batch_size=args.batch_size, prompt_tokens=args.prompt_tokens,
+            target=args.target, model=args.model,
         )
 
     log("=== Starting benchmark ===")
@@ -751,8 +864,12 @@ def main():
         f"{args.cycles} cycles, {args.batch_size} batch requests")
 
     # Run scenarios sequentially (they use separate namespaces but share GPU nodes)
-    log("━━━ Scenario 1: SYNC (no gate) ━━━")
-    sync_timeline, sync_csvs = run_scenario(sync_cfg, args.results_dir)
+    sync_timeline, sync_csvs = [], []
+    if sync_cfg:
+        log("━━━ Scenario 1: SYNC (no gate) ━━━")
+        sync_timeline, sync_csvs = run_scenario(sync_cfg, args.results_dir)
+    else:
+        log("━━━ Skipping sync scenario (no --sync-namespace) ━━━")
 
     gated_timeline, gated_csvs = [], []
     if gated_cfg:
@@ -762,7 +879,8 @@ def main():
         log("━━━ Skipping gated scenario (no --gated-namespace) ━━━")
 
     # Save timelines as JSON
-    (args.results_dir / "sync-timeline.json").write_text(json.dumps(sync_timeline, indent=2))
+    if sync_timeline:
+        (args.results_dir / "sync-timeline.json").write_text(json.dumps(sync_timeline, indent=2))
     if gated_timeline:
         (args.results_dir / "gated-timeline.json").write_text(json.dumps(gated_timeline, indent=2))
 

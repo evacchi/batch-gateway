@@ -105,12 +105,27 @@ helm install ${GUIDE_NAME} \
 > that allows the Istio gateway proxy to reach the EPP's ext-proc gRPC service.
 > Without it, requests will fail with 500 errors.
 
-## Step 6: Deploy vLLM model server (Qwen/Qwen3-0.6B)
+## Step 6: Deploy vLLM model server
+
+The kustomize overlay deploys Qwen/Qwen3-0.6B. For meaningful benchmark results,
+use a larger model like **Qwen/Qwen3-8B** — the 0.6B model is too small to
+saturate a single A100 GPU under typical batch + live traffic loads.
 
 ```bash
 kubectl apply -n ${NAMESPACE} -k ${ASYNC_REPO}/docs/guides/e2e-deploy/modelserver/
 kubectl wait --for=condition=Ready pod -l llm-d.ai/role=decode -n ${NAMESPACE} --timeout=300s
 ```
+
+> **Important:** The vLLM pod's container port must be named `modelserver` (not
+> `http`) to match the async-processor PodMonitor's `port:` selector. Without
+> this, Prometheus won't scrape vLLM metrics and the dispatch budget gate will
+> fall back to 0 (closed). If deploying a custom vLLM Deployment, ensure:
+> ```yaml
+> ports:
+>   - containerPort: 8000
+>     name: modelserver    # must match PodMonitor
+>     protocol: TCP
+> ```
 
 ## Step 7: Install Prometheus (skip if already installed)
 
