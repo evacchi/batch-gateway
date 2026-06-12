@@ -161,7 +161,7 @@ def submit_batch(cfg: ScenarioConfig, job_name="batch-submit"):
                   JSONL_FILE="/tmp/batch-input.jsonl"
                   i=0
                   while [ "$i" -lt "$BATCH_SIZE" ]; do
-                    echo '{{"custom_id":"bench-'$i'","method":"POST","url":"/v1/chat/completions","body":{{"model":"'$BATCH_MODEL'","max_tokens":128,"messages":[{{"role":"user","content":"Write a short paragraph about request number '$i'."}}]}}}}' >> "$JSONL_FILE"
+                    echo '{{"custom_id":"bench-'$i'","method":"POST","url":"/v1/chat/completions","body":{{"model":"'$BATCH_MODEL'","max_tokens":512,"messages":[{{"role":"user","content":"Write a detailed essay about the history, significance, and future implications of request number '$i'. Include multiple paragraphs with examples."}}]}}}}' >> "$JSONL_FILE"
                     i=$((i + 1))
                   done
                   echo "Generated $BATCH_SIZE requests"
@@ -206,7 +206,7 @@ def start_burst(cfg: ScenarioConfig):
     script_lines = [
         f'T="{cfg.target}"',
         f'M="{cfg.model}"',
-        'COMMON="--request-format text_completions --model $M --data prompt_tokens=256,output_tokens=128 --processor $M --disable-console-interactive"',
+        'COMMON="--request-format text_completions --model $M --data prompt_tokens=256,output_tokens=512 --processor $M --disable-console-interactive"',
         f'mkdir -p /results/{cfg.name}',
     ] + cycle_lines + ['echo "=== Done ==="']
 
@@ -460,16 +460,18 @@ def parse_csv_metrics(csv_path):
 
 
 def generate_html_report(results_dir: Path, sync_timeline, gated_timeline,
-                         sync_csvs: Path, gated_csvs: Path):
+                         sync_csvs, gated_csvs):
     """Generate an HTML report with charts comparing sync vs gated."""
 
     # Parse all CSV metrics
     sync_metrics = {}
     gated_metrics = {}
-    for csv_file in sorted(sync_csvs.glob("*.csv")):
-        sync_metrics[csv_file.stem] = parse_csv_metrics(csv_file)
-    for csv_file in sorted(gated_csvs.glob("*.csv")):
-        gated_metrics[csv_file.stem] = parse_csv_metrics(csv_file)
+    if isinstance(sync_csvs, Path):
+        for csv_file in sorted(sync_csvs.glob("*.csv")):
+            sync_metrics[csv_file.stem] = parse_csv_metrics(csv_file)
+    if isinstance(gated_csvs, Path):
+        for csv_file in sorted(gated_csvs.glob("*.csv")):
+            gated_metrics[csv_file.stem] = parse_csv_metrics(csv_file)
 
     # Build timeline data for chart
     sync_points = json.dumps([{"x": t["elapsed"], "y": t["completed"]} for t in sync_timeline])
