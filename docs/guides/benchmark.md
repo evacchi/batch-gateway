@@ -107,25 +107,36 @@ helm install ${GUIDE_NAME} \
 
 ## Step 6: Deploy vLLM model server
 
-The kustomize overlay deploys Qwen/Qwen3-0.6B. For meaningful benchmark results,
-use a larger model like **Qwen/Qwen3-8B** — the 0.6B model is too small to
-saturate a single A100 GPU under typical batch + live traffic loads.
+This repo includes a kustomize overlay for **Qwen/Qwen3-8B** (1×GPU,
+`max-model-len=4096`). The 0.6B model is too small to saturate a single A100
+under batch + live traffic loads.
 
 ```bash
-kubectl apply -n ${NAMESPACE} -k ${ASYNC_REPO}/docs/guides/e2e-deploy/modelserver/
+kubectl apply -n ${NAMESPACE} -k ${BATCH_REPO}/test/e2e/benchmark/modelserver/
 kubectl wait --for=condition=Ready pod -l llm-d.ai/role=decode -n ${NAMESPACE} --timeout=300s
 ```
 
-> **Important:** The vLLM pod's container port must be named `modelserver` (not
-> `http`) to match the async-processor PodMonitor's `port:` selector. Without
-> this, Prometheus won't scrape vLLM metrics and the dispatch budget gate will
-> fall back to 0 (closed). If deploying a custom vLLM Deployment, ensure:
+The overlay sets the labels that the InferencePool selector (`llm-d.ai/guide:
+optimized-baseline`) and PodMonitor (`llm-d.ai/role: decode`) require. It also
+names the container port `modelserver`, which the async-processor PodMonitor
+uses to discover scrape targets.
+
+> **Important:** If deploying a custom vLLM Deployment instead of this overlay,
+> it must have all three:
 > ```yaml
+> metadata:
+>   labels:
+>     llm-d.ai/role: decode                # PodMonitor + Prometheus scraping
+>     llm-d.ai/guide: optimized-baseline   # InferencePool endpoint discovery
+> # ...
 > ports:
 >   - containerPort: 8000
->     name: modelserver    # must match PodMonitor
+>     name: modelserver    # must match PodMonitor port selector
 >     protocol: TCP
 > ```
+> Without these labels, the EPP returns 503 ("failed to find endpoint
+> candidates") and Prometheus won't scrape vLLM metrics, causing the dispatch
+> gate to fall back to 0 (closed).
 
 ## Step 7: Install Prometheus (skip if already installed)
 
@@ -204,21 +215,46 @@ helm install batch-gateway ${BATCH_REPO}/charts/batch-gateway/ \
 
 ## Step 13: Deploy async processor with dispatch budget gate
 
+The async processor dispatches batch requests through the inference gateway,
+gated by a Prometheus query that measures remaining capacity. Three settings
+need to match your deployment:
+
+- **Queue names** must follow the batch-gateway convention:
+  `llm-d-async:requests:<poolName>` and `llm-d-async:results:<poolName>`.
+- **`max_concurrency`** is the per-pod request capacity used to compute the
+  budget. Set it to the point where adding one more concurrent request starts
+  degrading TTFT. For Qwen3-8B on a single A100, this is approximately **30**.
+  Setting it too high (e.g. 100) means the budget stays near 1.0 even under
+  heavy load and the gate never closes.
+- **PromQL query** must filter by `namespace` to avoid matching metrics from
+  other namespaces on the same Prometheus instance.
+
 ```bash
 helm install async-processor ${ASYNC_REPO}/charts/async-processor/ \
     -f ${ASYNC_REPO}/docs/guides/e2e-deploy/async-processor-values.yaml \
     --set "ap.redis.url=redis://redis-master.${NAMESPACE}.svc.cluster.local:6379" \
+    --set "ap.redis.resultQueueName=llm-d-async:results:${GUIDE_NAME}" \
+    --set "ap.redis.queuesConfig[0].queue_name=llm-d-async:requests:${GUIDE_NAME}" \
+    --set "ap.redis.queuesConfig[0].request_path_url=/v1/completions" \
+    --set "ap.redis.queuesConfig[0].igw_base_url=http://llm-d-inference-gateway-istio:80" \
+    --set "ap.redis.queuesConfig[0].gate_type=prometheus-query" \
+    --set-string "ap.redis.queuesConfig[0].gate_params.query=1 - (sum(vllm:num_requests_running{namespace=\"${NAMESPACE}\"}) / on() (inference_pool_ready_pods{name=\"${GUIDE_NAME}\"\,namespace=\"${NAMESPACE}\"} * 30))" \
+    --set "ap.redis.queuesConfig[0].gate_params.fallback=0.0" \
     -n ${NAMESPACE}
 ```
 
 > **Note:** The `async-processor-values.yaml` references image tag `938cd44`.
 > If you need a newer version, override with
-> `--set ap.image.repository=<repo> --set ap.image.tag=<tag>`.
+> `--set ap.image.repository=<repo> --set-string ap.image.tag=<tag>`.
 > The image must be built for `linux/amd64` — if building on Apple Silicon, use
 > `docker buildx build --platform linux/amd64`.
 
-The async processor is not needed for the baseline and sync scenarios. You can
-scale it to 0 initially and bring it up for the gated/ungated scenarios:
+> **Note:** The `* 30` in the PromQL query is the `max_concurrency` value. If
+> you change the model or GPU (and thus the saturation point), update this
+> constant to match.
+
+The async processor is not needed for the sync scenario. You can scale it to 0
+initially and bring it up for the gated scenario:
 
 ```bash
 kubectl scale deployment async-processor -n ${NAMESPACE} --replicas=0
@@ -233,7 +269,7 @@ kubectl get pods -n ${NAMESPACE}
 # Gateway routes to vLLM
 kubectl run --rm -i test-gateway --image=curlimages/curl --restart=Never \
     -n ${NAMESPACE} -- curl -s "http://llm-d-inference-gateway-istio/v1/models"
-# Expected: JSON with "id":"Qwen/Qwen3-0.6B"
+# Expected: JSON with "id":"Qwen/Qwen3-8B"
 ```
 
 ## Step 15: Create the results PVC
@@ -360,7 +396,7 @@ helm uninstall redis -n ${NAMESPACE}
 helm uninstall postgresql -n ${NAMESPACE}
 kubectl delete secret batch-gateway-secrets -n ${NAMESPACE}
 kubectl delete pvc batch-gateway-files -n ${NAMESPACE}
-kubectl delete -n ${NAMESPACE} -k ${ASYNC_REPO}/docs/guides/e2e-deploy/modelserver/
+kubectl delete -n ${NAMESPACE} -k ${BATCH_REPO}/test/e2e/benchmark/modelserver/
 helm uninstall ${GUIDE_NAME} -n ${NAMESPACE}
 kubectl delete -k ${LLM_D_REPO}/guides/recipes/gateway/istio -n ${NAMESPACE}
 ```
