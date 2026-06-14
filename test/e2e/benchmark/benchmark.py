@@ -39,7 +39,7 @@ class ScenarioConfig:
     batch_size: int
     prompt_tokens: int = 1500
     target: str = "http://llm-d-inference-gateway-istio"
-    model: str = "Qwen/Qwen3-0.6B"
+    model: str = "Qwen/Qwen3-8B"
 
 
 @dataclass
@@ -87,6 +87,8 @@ def cleanup_namespace(context, namespace):
 
     kubectl(["delete", "job", "guidellm-burst", "batch-submit", "batch-submit-2",
              "--ignore-not-found"], context, namespace, check=False)
+    kubectl(["delete", "configmap", "batch-submit-script", "batch-submit-2-script",
+             "--ignore-not-found"], context, namespace, check=False)
 
     kubectl(["scale", "deployment",
              "batch-gateway-processor", "batch-gateway-apiserver",
@@ -132,10 +134,105 @@ def cleanup_namespace(context, namespace):
     log(f"  Redis DBSIZE: {out}")
 
 
+def _batch_script():
+    """Python script for batch Job. Uses Faker (same as guidellm) for prompts."""
+    return textwrap.dedent("""\
+        import json, os, time
+        from urllib.request import urlopen, Request
+        from faker import Faker
+
+        base_url = os.environ["BATCH_GATEWAY_URL"]
+        model = os.environ["BATCH_MODEL"]
+        batch_size = int(os.environ["BATCH_SIZE"])
+        prompt_chars = int(os.environ["PROMPT_CHARS"])
+
+        faker = Faker()
+        faker.seed_instance(42)
+        jsonl_path = "/tmp/batch-input.jsonl"
+        with open(jsonl_path, "w") as f:
+            for i in range(batch_size):
+                prompt = f"{i} " + faker.text(max_nb_chars=prompt_chars)
+                line = json.dumps({
+                    "custom_id": f"bench-{i}",
+                    "method": "POST",
+                    "url": "/v1/chat/completions",
+                    "body": {
+                        "model": model,
+                        "messages": [{"role": "user", "content": prompt}],
+                    },
+                })
+                f.write(line + "\\n")
+        print(f"Generated {batch_size} requests (~{prompt_chars} chars each)")
+
+        boundary = "----BatchBoundary"
+        with open(jsonl_path, "rb") as f:
+            file_data = f.read()
+        body = (
+            f"--{boundary}\\r\\n"
+            f'Content-Disposition: form-data; name="purpose"\\r\\n\\r\\n'
+            f"batch\\r\\n"
+            f"--{boundary}\\r\\n"
+            f'Content-Disposition: form-data; name="file"; filename="input.jsonl"\\r\\n'
+            f"Content-Type: application/octet-stream\\r\\n\\r\\n"
+        ).encode() + file_data + f"\\r\\n--{boundary}--\\r\\n".encode()
+        req = Request(
+            f"{base_url}/v1/files",
+            data=body,
+            headers={
+                "Content-Type": f"multipart/form-data; boundary={boundary}",
+                "Authorization": "Bearer benchmark",
+            },
+        )
+        resp = json.loads(urlopen(req).read())
+        file_id = resp["id"]
+        print(f"Uploaded: {file_id}")
+
+        batch_body = json.dumps({
+            "input_file_id": file_id,
+            "endpoint": "/v1/chat/completions",
+            "completion_window": "24h",
+        }).encode()
+        req = Request(
+            f"{base_url}/v1/batches",
+            data=batch_body,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": "Bearer benchmark",
+            },
+        )
+        resp = json.loads(urlopen(req).read())
+        batch_id = resp["id"]
+        print(f"Batch: {batch_id}")
+
+        timeout = 3600
+        elapsed = 0
+        while elapsed < timeout:
+            req = Request(
+                f"{base_url}/v1/batches/{batch_id}",
+                headers={"Authorization": "Bearer benchmark"},
+            )
+            status = json.loads(urlopen(req).read())
+            s = status["status"]
+            c = status["request_counts"].get("completed", 0)
+            t = status["request_counts"].get("total", 0)
+            print(f"Batch {batch_id}: status={s} completed={c}/{t} ({elapsed}s)")
+            if s in ("completed", "failed", "cancelled", "expired"):
+                print(f"Terminal: {s}")
+                break
+            time.sleep(5)
+            elapsed += 5
+        else:
+            print("Timed out")
+    """)
+
+
 def submit_batch(cfg: ScenarioConfig, job_name="batch-submit"):
-    prompt_chars = cfg.prompt_tokens * 3
+    prompt_chars = cfg.prompt_tokens * 5
     log(f"Submitting {cfg.batch_size}-request batch ({job_name}) in {cfg.namespace} "
-        f"(~{cfg.prompt_tokens} tokens/request, random prompts)")
+        f"(~{cfg.prompt_tokens} tokens/request, faker prompts)")
+    script = _batch_script()
+    # Indent script lines for YAML block scalar (10 spaces = inside command block)
+    indented = "\n".join("          " + line for line in script.splitlines())
     yaml = textwrap.dedent(f"""\
     apiVersion: batch/v1
     kind: Job
@@ -148,7 +245,7 @@ def submit_batch(cfg: ScenarioConfig, job_name="batch-submit"):
           restartPolicy: Never
           containers:
             - name: batch-submit
-              image: curlimages/curl:latest
+              image: python:3.12-slim
               env:
                 - name: BATCH_GATEWAY_URL
                   value: "http://batch-gateway-apiserver:8000"
@@ -156,42 +253,28 @@ def submit_batch(cfg: ScenarioConfig, job_name="batch-submit"):
                   value: "{cfg.model}"
                 - name: BATCH_SIZE
                   value: "{cfg.batch_size}"
-              command:
-                - sh
-                - -c
-                - |
-                  set -e
-                  JSONL_FILE="/tmp/batch-input.jsonl"
-                  PROMPT_CHARS={prompt_chars}
-                  i=0
-                  while [ "$i" -lt "$BATCH_SIZE" ]; do
-                    RAND=$(cat /dev/urandom | tr -dc 'a-zA-Z0-9 ' | head -c "$PROMPT_CHARS")
-                    printf '{{"custom_id":"bench-%s","method":"POST","url":"/v1/chat/completions","body":{{"model":"%s","messages":[{{"role":"user","content":"%s"}}]}}}}\\n' "$i" "$BATCH_MODEL" "$RAND" >> "$JSONL_FILE"
-                    i=$((i + 1))
-                  done
-                  echo "Generated $BATCH_SIZE requests (~$PROMPT_CHARS chars each)"
-                  FILE_RESPONSE=$(curl -sk "$BATCH_GATEWAY_URL/v1/files" -H "Authorization: Bearer benchmark" -F "purpose=batch" -F "file=@$JSONL_FILE")
-                  FILE_ID=$(echo "$FILE_RESPONSE" | grep -o '"id":"[^"]*"' | head -1 | cut -d'"' -f4)
-                  [ -z "$FILE_ID" ] && echo "Upload failed: $FILE_RESPONSE" && exit 1
-                  echo "Uploaded: $FILE_ID"
-                  BATCH_RESPONSE=$(curl -sk "$BATCH_GATEWAY_URL/v1/batches" -H "Authorization: Bearer benchmark" -H "Content-Type: application/json" -d '{{"input_file_id":"'$FILE_ID'","endpoint":"/v1/chat/completions","completion_window":"24h"}}')
-                  BATCH_ID=$(echo "$BATCH_RESPONSE" | grep -o '"id":"[^"]*"' | head -1 | cut -d'"' -f4)
-                  [ -z "$BATCH_ID" ] && echo "Batch failed: $BATCH_RESPONSE" && exit 1
-                  echo "Batch: $BATCH_ID"
-                  TIMEOUT=1200
-                  ELAPSED=0
-                  while [ "$ELAPSED" -lt "$TIMEOUT" ]; do
-                    STATUS_RESPONSE=$(curl -sk "$BATCH_GATEWAY_URL/v1/batches/$BATCH_ID" -H "Authorization: Bearer benchmark")
-                    STATUS=$(echo "$STATUS_RESPONSE" | grep -o '"status":"[^"]*"' | head -1 | cut -d'"' -f4)
-                    COMPLETED=$(echo "$STATUS_RESPONSE" | grep -o '"completed":[0-9]*' | head -1 | cut -d: -f2)
-                    TOTAL=$(echo "$STATUS_RESPONSE" | grep -o '"total":[0-9]*' | head -1 | cut -d: -f2)
-                    echo "Batch $BATCH_ID: status=$STATUS completed=$COMPLETED/$TOTAL (${{ELAPSED}}s)"
-                    case "$STATUS" in completed|failed|cancelled|expired) echo "Terminal: $STATUS"; exit 0;; esac
-                    sleep 5
-                    ELAPSED=$((ELAPSED + 5))
-                  done
-                  echo "Timed out"
+                - name: PROMPT_CHARS
+                  value: "{prompt_chars}"
+              command: ["sh", "-c", "pip install -q faker && python3 /tmp/script.py"]
+              volumeMounts:
+                - name: script
+                  mountPath: /tmp/script.py
+                  subPath: script.py
+          volumes:
+            - name: script
+              configMap:
+                name: {job_name}-script
     """)
+    # Create ConfigMap with the script, then the Job
+    cm_yaml = textwrap.dedent(f"""\
+    apiVersion: v1
+    kind: ConfigMap
+    metadata:
+      name: {job_name}-script
+    data:
+      script.py: |
+    """) + indented + "\n"
+    kubectl_apply(cm_yaml, cfg.context, cfg.namespace)
     kubectl_apply(yaml, cfg.context, cfg.namespace)
 
 
@@ -895,7 +978,7 @@ def main():
                         help="Input tokens per request (batch and live traffic)")
     parser.add_argument("--results-dir", type=Path, default=Path("./benchmark-results"))
     parser.add_argument("--target", default="http://llm-d-inference-gateway-istio")
-    parser.add_argument("--model", default="Qwen/Qwen3-0.6B")
+    parser.add_argument("--model", default="Qwen/Qwen3-8B")
     args = parser.parse_args()
 
     args.results_dir.mkdir(parents=True, exist_ok=True)
