@@ -31,11 +31,10 @@ class ScenarioConfig:
     name: str
     namespace: str
     context: str
-    burst_rate: int
+    burst_rates: list
     idle_rate: int
     burst_seconds: int
     idle_seconds: int
-    cycles: int
     batch_size: int
     num_batches: int = 1
     prompt_tokens: int = 1500
@@ -290,16 +289,17 @@ def submit_batch(cfg: ScenarioConfig, job_name="batch-submit"):
 
 
 def start_burst(cfg: ScenarioConfig):
-    log(f"Starting burst pattern in {cfg.namespace}: {cfg.cycles} cycles, "
-        f"burst@{cfg.burst_rate}/s for {cfg.burst_seconds}s, idle@{cfg.idle_rate}/s for {cfg.idle_seconds}s")
+    rates_str = "/".join(str(r) for r in cfg.burst_rates)
+    log(f"Starting burst pattern in {cfg.namespace}: rates [{rates_str}] req/s, "
+        f"burst {cfg.burst_seconds}s, idle@{cfg.idle_rate}/s for {cfg.idle_seconds}s")
 
     cycle_lines = []
-    for c in range(1, cfg.cycles + 1):
+    for c, rate in enumerate(cfg.burst_rates, 1):
         cycle_lines.extend([
-            f'echo "=== Cycle {c}: IDLE ({cfg.idle_rate} req/s, {cfg.idle_seconds}s) ==="',
+            f'echo "=== Phase {c}: IDLE ({cfg.idle_rate} req/s, {cfg.idle_seconds}s) ==="',
             f'guidellm benchmark run --target "$T" $COMMON --profile constant --rate {cfg.idle_rate} --max-seconds {cfg.idle_seconds} --output-dir /results/{cfg.name} --outputs "idle-{c}.csv"',
-            f'echo "=== Cycle {c}: BURST ({cfg.burst_rate} req/s, {cfg.burst_seconds}s) ==="',
-            f'guidellm benchmark run --target "$T" $COMMON --profile constant --rate {cfg.burst_rate} --max-seconds {cfg.burst_seconds} --output-dir /results/{cfg.name} --outputs "burst-{c}.csv"',
+            f'echo "=== Phase {c}: BURST ({rate} req/s, {cfg.burst_seconds}s) ==="',
+            f'guidellm benchmark run --target "$T" $COMMON --profile constant --rate {rate} --max-seconds {cfg.burst_seconds} --output-dir /results/{cfg.name} --outputs "burst-{c}.csv"',
         ])
 
     script_lines = [
@@ -469,7 +469,7 @@ def monitor_scenario(cfg: ScenarioConfig):
 
         if guidellm_done and batch_done:
             break
-        if elapsed > (cfg.cycles * (cfg.burst_seconds + cfg.idle_seconds) + 300):
+        if elapsed > (len(cfg.burst_rates) * (cfg.burst_seconds + cfg.idle_seconds) + 300):
             log(f"  [{cfg.name}] Timeout, stopping monitor")
             break
 
@@ -631,18 +631,21 @@ def generate_html_report(results_dir: Path, sync_timeline, gated_timeline,
     gated_batch_idle = batch_during_phase(gated_timeline, "IDLE")
 
     # Read config from timeline metadata
-    cfg_burst_rate = 30
+    cfg_burst_rates = []
     cfg_idle_rate = 1
     cfg_burst_sec = 60
     cfg_idle_sec = 120
     cfg_batch_size = 500
     cfg_model = "Qwen/Qwen3-8B"
-    if sync_timeline:
-        for t in sync_timeline:
+    tl = sync_timeline or gated_timeline
+    if tl:
+        for t in tl:
             p = t.get("phase", "")
             if "BURST" in p and "req/s" in p:
                 try:
-                    cfg_burst_rate = int(p.split("(")[1].split(" ")[0])
+                    rate = int(p.split("(")[1].split(" ")[0])
+                    if rate not in cfg_burst_rates:
+                        cfg_burst_rates.append(rate)
                     cfg_burst_sec = int(p.split(", ")[1].rstrip("s)"))
                 except (IndexError, ValueError):
                     pass
@@ -652,8 +655,9 @@ def generate_html_report(results_dir: Path, sync_timeline, gated_timeline,
                     cfg_idle_sec = int(p.split(", ")[1].rstrip("s)"))
                 except (IndexError, ValueError):
                     pass
-        if sync_timeline[-1].get("total", 0) > 0:
-            cfg_batch_size = sync_timeline[-1]["total"]
+        if tl[-1].get("total", 0) > 0:
+            cfg_batch_size = tl[-1]["total"]
+    cfg_burst_rate_str = "/".join(str(r) for r in cfg_burst_rates) if cfg_burst_rates else "N/A"
 
     # Compute live traffic impact metrics from burst phases
     def burst_stats(metrics_dict):
@@ -717,7 +721,7 @@ def generate_html_report(results_dir: Path, sync_timeline, gated_timeline,
             compared on identical hardware:</p>
             <table class="workload-table">
                 <tr><td>Model</td><td><code>{cfg_model}</code> on 1x NVIDIA A100 GPU</td></tr>
-                <tr><td>Live traffic</td><td>guidellm burst/idle cycles: <strong>{cfg_burst_rate} req/s</strong> for {cfg_burst_sec}s (burst),
+                <tr><td>Live traffic</td><td>guidellm burst/idle cycles: <strong>{cfg_burst_rate_str} req/s</strong> for {cfg_burst_sec}s (burst),
                     <strong>{cfg_idle_rate} req/s</strong> for {cfg_idle_sec}s (idle), 2 cycles</td></tr>
                 <tr><td>Batch load</td><td>{cfg_batch_size} requests submitted at start (idle), another {cfg_batch_size} submitted during first burst</td></tr>
                 <tr><td>Batch requests</td><td>~2000 random input tokens, no output cap (defeats prefix caching)</td></tr>
@@ -762,7 +766,7 @@ def generate_html_report(results_dir: Path, sync_timeline, gated_timeline,
         </div>
 
         <h2>Live Traffic Impact</h2>
-        <p>Each burst phase sends requests at {cfg_burst_rate} req/s for {cfg_burst_sec}s. Requests still in-flight
+        <p>Each burst phase sends requests at {cfg_burst_rate_str} req/s for {cfg_burst_sec}s. Requests still in-flight
         when the phase window closes are marked <strong>incomplete</strong> &mdash; they were delayed by GPU
         contention from concurrent batch processing. Every batch request dispatched during burst is capacity
         stolen from live traffic.</p>
@@ -834,7 +838,7 @@ def generate_html_report(results_dir: Path, sync_timeline, gated_timeline,
             <h2 style="margin-top:0">Conclusion</h2>
             <p>Without the dispatch budget gate (<strong>sync</strong>), the batch processor sends
             {cfg_batch_size} requests directly to the inference gateway during burst, competing with
-            {cfg_burst_rate} req/s of live traffic for GPU compute. During burst phases,
+            {cfg_burst_rate_str} req/s of live traffic for GPU compute. During burst phases,
             <strong>{sync_burst_successful} of {sync_burst_total}</strong> live requests completed
             in time (TTFT {sync_burst_ttft}), while <strong>{sync_batch_burst}</strong> batch requests
             consumed GPU capacity that could have served live traffic.</p>
@@ -982,11 +986,11 @@ def main():
     parser.add_argument("--sync-namespace", default="", help="Namespace for sync scenario (omit to skip)")
     parser.add_argument("--gated-namespace", default="", help="Namespace for gated scenario (omit to skip)")
     parser.add_argument("--batch-size", type=int, default=50)
-    parser.add_argument("--burst-rate", type=int, default=15)
+    parser.add_argument("--burst-rates", type=int, nargs="+", default=[15],
+                        help="Burst rates in req/s (one per phase)")
     parser.add_argument("--idle-rate", type=int, default=1)
     parser.add_argument("--burst-seconds", type=int, default=60)
     parser.add_argument("--idle-seconds", type=int, default=120)
-    parser.add_argument("--cycles", type=int, default=2)
     parser.add_argument("--num-batches", type=int, default=1,
                         help="Number of concurrent batches to submit")
     parser.add_argument("--prompt-tokens", type=int, default=1500,
@@ -1002,9 +1006,8 @@ def main():
     if args.sync_namespace:
         sync_cfg = ScenarioConfig(
             name="sync", namespace=args.sync_namespace, context=args.context,
-            burst_rate=args.burst_rate, idle_rate=args.idle_rate,
+            burst_rates=args.burst_rates, idle_rate=args.idle_rate,
             burst_seconds=args.burst_seconds, idle_seconds=args.idle_seconds,
-            cycles=args.cycles,
             batch_size=args.batch_size, num_batches=args.num_batches,
             prompt_tokens=args.prompt_tokens,
             target=args.target, model=args.model,
@@ -1013,33 +1016,37 @@ def main():
     if args.gated_namespace:
         gated_cfg = ScenarioConfig(
             name="gated", namespace=args.gated_namespace, context=args.context,
-            burst_rate=args.burst_rate, idle_rate=args.idle_rate,
+            burst_rates=args.burst_rates, idle_rate=args.idle_rate,
             burst_seconds=args.burst_seconds, idle_seconds=args.idle_seconds,
-            cycles=args.cycles,
             batch_size=args.batch_size, num_batches=args.num_batches,
             prompt_tokens=args.prompt_tokens,
             target=args.target, model=args.model,
         )
 
+    rates_str = "/".join(str(r) for r in args.burst_rates)
     log("=== Starting benchmark ===")
-    log(f"Burst: {args.burst_rate} req/s for {args.burst_seconds}s, "
+    log(f"Burst rates: [{rates_str}] req/s for {args.burst_seconds}s each, "
         f"Idle: {args.idle_rate} req/s for {args.idle_seconds}s, "
-        f"{args.cycles} cycles, {args.num_batches}x{args.batch_size} batch requests")
+        f"{args.num_batches}x{args.batch_size} batch requests")
 
-    # Run scenarios sequentially (they use separate namespaces but share GPU nodes)
     sync_timeline, sync_csvs = [], []
-    if sync_cfg:
-        log("━━━ Scenario 1: SYNC (no gate) ━━━")
-        sync_timeline, sync_csvs = run_scenario(sync_cfg, args.results_dir)
-    else:
-        log("━━━ Skipping sync scenario (no --sync-namespace) ━━━")
-
     gated_timeline, gated_csvs = [], []
-    if gated_cfg:
-        log("━━━ Scenario 2: GATED (prometheus-budget gate) ━━━")
-        gated_timeline, gated_csvs = run_scenario(gated_cfg, args.results_dir)
+
+    if sync_cfg and gated_cfg:
+        import concurrent.futures
+        log("━━━ Running SYNC and GATED in parallel ━━━")
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            sync_future = executor.submit(run_scenario, sync_cfg, args.results_dir)
+            gated_future = executor.submit(run_scenario, gated_cfg, args.results_dir)
+            sync_timeline, sync_csvs = sync_future.result()
+            gated_timeline, gated_csvs = gated_future.result()
     else:
-        log("━━━ Skipping gated scenario (no --gated-namespace) ━━━")
+        if sync_cfg:
+            log("━━━ Scenario 1: SYNC (no gate) ━━━")
+            sync_timeline, sync_csvs = run_scenario(sync_cfg, args.results_dir)
+        if gated_cfg:
+            log("━━━ Scenario 2: GATED (prometheus-budget gate) ━━━")
+            gated_timeline, gated_csvs = run_scenario(gated_cfg, args.results_dir)
 
     # Save timelines as JSON
     if sync_timeline:

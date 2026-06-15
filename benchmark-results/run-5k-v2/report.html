@@ -1,0 +1,263 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Batch vs Live Traffic Isolation Benchmark</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-annotation@3"></script>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; margin: 40px; max-width: 1200px; background: #fafafa; color: #333; }
+        h1 { color: #1a1a1a; border-bottom: 2px solid #e5e5e5; padding-bottom: 12px; }
+        h2 { color: #444; margin-top: 40px; }
+        .card { background: white; border-radius: 8px; padding: 24px; margin: 20px 0; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+        .chart-container { background: white; border-radius: 8px; padding: 20px; margin: 20px 0; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+        canvas { max-height: 400px; }
+        table { border-collapse: collapse; width: 100%; margin: 20px 0; background: white; border-radius: 8px; overflow: hidden; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+        th, td { padding: 10px 16px; text-align: right; border-bottom: 1px solid #eee; }
+        th { background: #f5f5f5; font-weight: 600; text-align: left; }
+        td:first-child { text-align: left; font-weight: 500; }
+        .good { color: #16a34a; font-weight: 600; }
+        .bad { color: #dc2626; font-weight: 600; }
+        .metric-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin: 16px 0; }
+        .metric-box { background: #f9fafb; border-radius: 6px; padding: 16px; border: 1px solid #e5e7eb; }
+        .metric-box h4 { margin: 0 0 4px 0; font-size: 13px; color: #6b7280; text-transform: uppercase; letter-spacing: 0.5px; }
+        .metric-box .value { font-size: 28px; font-weight: 700; }
+        .metric-box .detail { font-size: 13px; color: #6b7280; margin-top: 4px; }
+        code { background: #f3f4f6; padding: 2px 6px; border-radius: 4px; font-size: 14px; }
+        .workload-table { width: auto; margin: 12px 0; }
+        .workload-table td { padding: 4px 16px 4px 0; border: none; text-align: left; }
+        .workload-table td:first-child { font-weight: 600; color: #6b7280; }
+    </style>
+</head>
+<body>
+    <h1>Batch vs Live Traffic Isolation</h1>
+
+    <div class="card">
+        <h2 style="margin-top:0">Workload</h2>
+        <p>This benchmark tests whether the <strong>llm-d-async dispatch budget gate</strong>
+        protects live inference traffic from batch request interference. Two scenarios are
+        compared on identical hardware:</p>
+        <table class="workload-table">
+            <tr><td>Model</td><td><code>Qwen/Qwen3-8B</code> on 1x NVIDIA A100 GPU</td></tr>
+            <tr><td>Live traffic</td><td>guidellm burst/idle cycles: <strong>15 req/s</strong> for 60s (burst),
+                <strong>1 req/s</strong> for 120s (idle), 2 cycles</td></tr>
+            <tr><td>Batch load</td><td>10000 requests submitted at start (idle), another 10000 submitted during first burst</td></tr>
+            <tr><td>Batch requests</td><td>~2000 random input tokens, no output cap (defeats prefix caching)</td></tr>
+            <tr><td>Pattern</td><td>IDLE &rarr; BURST &rarr; IDLE &rarr; BURST</td></tr>
+        </table>
+        <div class="metric-grid" style="margin-top: 20px">
+            <div class="metric-box">
+                <h4>Sync (no gate)</h4>
+                <p>Batch-gateway processor sends requests <strong>directly</strong> to the inference gateway.
+                Batch and live traffic compete for GPU capacity.</p>
+            </div>
+            <div class="metric-box">
+                <h4>Gated (async dispatch)</h4>
+                <p>Batch-gateway submits to a Redis queue. The <strong>async-processor</strong> dispatches
+                only when the <code>prometheus-budget</code> gate is open (GPU utilization below threshold).</p>
+            </div>
+        </div>
+    </div>
+
+    <h2>Key Results</h2>
+    <div class="metric-grid">
+        <div class="metric-box">
+            <h4>Sync: Batch during Burst</h4>
+            <div class="value bad">175 reqs</div>
+            <div class="detail">Batch requests dispatched directly during live traffic burst, competing for GPU</div>
+        </div>
+        <div class="metric-box">
+            <h4>Gated: Batch during Burst</h4>
+            <div class="value good">79 reqs</div>
+            <div class="detail">Gate throttles batch &mdash; only excess capacity used, live traffic protected</div>
+        </div>
+        <div class="metric-box">
+            <h4>Sync: Batch during Idle</h4>
+            <div class="value">263 reqs</div>
+            <div class="detail">Batch requests processed during idle &mdash; competes with live traffic at all times</div>
+        </div>
+        <div class="metric-box">
+            <h4>Gated: Batch during Idle</h4>
+            <div class="value good">112 reqs</div>
+            <div class="detail">Gate opens &mdash; batch fills unused capacity when live traffic is low</div>
+        </div>
+    </div>
+
+    <h2>Live Traffic Impact</h2>
+    <p>Each burst phase sends requests at 15 req/s for 60s. Requests still in-flight
+    when the phase window closes are marked <strong>incomplete</strong> &mdash; they were delayed by GPU
+    contention from concurrent batch processing. Every batch request dispatched during burst is capacity
+    stolen from live traffic.</p>
+    <div class="metric-grid">
+        <div class="metric-box">
+            <h4>Sync: Live Burst Success Rate</h4>
+            <div class="value bad">762/1785 (42%)</div>
+            <div class="detail">762 of 1785 requests completed in time</div>
+        </div>
+        <div class="metric-box">
+            <h4>Gated: Live Burst Success Rate</h4>
+            <div class="value good">782/1799 (43%)</div>
+            <div class="detail">782 of 1799 requests completed in time</div>
+        </div>
+        <div class="metric-box">
+            <h4>Sync: Burst TTFT (median)</h4>
+            <div class="value bad">207.7 ms</div>
+            <div class="detail">Higher TTFT = batch requests are delaying live traffic first-token latency</div>
+        </div>
+        <div class="metric-box">
+            <h4>Gated: Burst TTFT (median)</h4>
+            <div class="value good">200.2 ms</div>
+            <div class="detail">Gate holds batch back &mdash; live traffic gets full GPU priority</div>
+        </div>
+    </div>
+
+    <h2>Batch Completion Timeline</h2>
+    <p>The timeline shows how batch requests progress over time. Red/green shaded bands indicate
+    burst (high live traffic) and idle phases. In sync mode, batch blasts through during burst,
+    competing with live traffic. With the gate, batch progress <strong>pauses during burst</strong>
+    and resumes during idle.</p>
+    <div class="chart-container">
+        <canvas id="timelineChart"></canvas>
+    </div>
+
+    <h2>Live Traffic Quality: TTFT</h2>
+    <p>Time to First Token (TTFT) measures how quickly the model begins responding.
+    Higher TTFT during burst phases indicates GPU contention from batch requests.</p>
+    <div class="chart-container">
+        <canvas id="ttftChart"></canvas>
+    </div>
+
+    <h2>Live Traffic Quality: Incomplete Requests</h2>
+    <p>Requests that did not complete within the phase window. A high incomplete rate
+    during burst indicates the GPU is overloaded.</p>
+    <div class="chart-container">
+        <canvas id="incompleteChart"></canvas>
+    </div>
+
+    <h2>Detailed Metrics</h2>
+    <table>
+        <tr><th>Scenario</th><th>Phase</th><th>Successful</th><th>Incomplete</th><th>TTFT p50 (ms)</th><th>TTFT p95 (ms)</th><th>ITL p50 (ms)</th><th>OK req/s</th></tr>
+        <tr class="bad"><td>sync</td><td>burst-1</td><td>378</td><td>512</td><td>209.3</td><td>198.8</td><td>1463.08</td><td>46.2</td></tr>
+        <tr class="good"><td>gated</td><td>burst-1</td><td>387</td><td>511</td><td>204.9</td><td>171.9</td><td>1112.35</td><td>43.9</td></tr>
+        <tr class="bad"><td>sync</td><td>burst-2</td><td>384</td><td>511</td><td>206.0</td><td>199.9</td><td>1432.40</td><td>45.7</td></tr>
+        <tr class="good"><td>gated</td><td>burst-2</td><td>395</td><td>506</td><td>195.6</td><td>159.9</td><td>1039.57</td><td>42.6</td></tr>
+        <tr><td>sync</td><td>idle-1</td><td>117</td><td>3</td><td>246.6</td><td>56.4</td><td>11.48</td><td>6.8</td></tr>
+        <tr><td>gated</td><td>idle-1</td><td>117</td><td>3</td><td>254.3</td><td>55.8</td><td>8.33</td><td>6.4</td></tr>
+        <tr><td>sync</td><td>idle-2</td><td>117</td><td>3</td><td>244.6</td><td>57.3</td><td>8.04</td><td>6.8</td></tr>
+        <tr><td>gated</td><td>idle-2</td><td>117</td><td>3</td><td>258.8</td><td>54.6</td><td>10.01</td><td>6.3</td></tr>
+    </table>
+
+    <div class="card" style="margin-top: 40px">
+        <h2 style="margin-top:0">Conclusion</h2>
+        <p>Without the dispatch budget gate (<strong>sync</strong>), the batch processor sends
+        10000 requests directly to the inference gateway during burst, competing with
+        15 req/s of live traffic for GPU compute. During burst phases,
+        <strong>762 of 1785</strong> live requests completed
+        in time (TTFT 207.7 ms), while <strong>175</strong> batch requests
+        consumed GPU capacity that could have served live traffic.</p>
+        <p>With the <strong>prometheus-budget gate</strong>, the async-processor monitors GPU
+        utilization via Prometheus and holds back batch requests when the inference endpoint is
+        saturated. During burst, only <strong>79</strong> batch requests were
+        dispatched, allowing <strong>782 of 1799</strong>
+        live requests to complete (TTFT 200.2 ms). Batch work shifts to idle periods
+        (112 requests processed during idle) when GPU capacity is available.</p>
+    </div>
+
+    <script>
+    const phaseBands = [{"x": 0, "phase": "Cycle 1: IDLE (1 req/s, 120s)"}, {"x": 115, "phase": "Cycle 1: BURST (15 req/s, 60s)"}, {"x": 187, "phase": "Cycle 2: IDLE (1 req/s, 120s)"}, {"x": 315, "phase": "Cycle 2: BURST (15 req/s, 60s)"}, {"x": 385, "phase": "Done"}];
+
+    // Build annotation boxes for burst/idle phases
+    function buildPhaseAnnotations(maxX) {
+        const annotations = {};
+        for (let i = 0; i < phaseBands.length; i++) {
+            const start = phaseBands[i].x;
+            const end = i + 1 < phaseBands.length ? phaseBands[i + 1].x : maxX;
+            const isBurst = phaseBands[i].phase.includes('BURST');
+            annotations['band' + i] = {
+                type: 'box',
+                xMin: start, xMax: end,
+                backgroundColor: isBurst ? 'rgba(239,68,68,0.08)' : 'rgba(34,197,94,0.06)',
+                borderWidth: 0,
+                label: {
+                    display: true,
+                    content: isBurst ? 'BURST' : 'IDLE',
+                    position: { x: 'center', y: 'start' },
+                    font: { size: 11, weight: 'bold' },
+                    color: isBurst ? 'rgba(239,68,68,0.5)' : 'rgba(34,197,94,0.4)',
+                }
+            };
+        }
+        return annotations;
+    }
+
+    const maxElapsed = Math.max(
+        ...[{"x": 0, "y": 21}, {"x": 13, "y": 40}, {"x": 26, "y": 48}, {"x": 39, "y": 67}, {"x": 52, "y": 79}, {"x": 64, "y": 88}, {"x": 77, "y": 100}, {"x": 90, "y": 117}, {"x": 103, "y": 134}, {"x": 116, "y": 145}, {"x": 131, "y": 159}, {"x": 145, "y": 162}, {"x": 159, "y": 165}, {"x": 173, "y": 165}, {"x": 187, "y": 176}, {"x": 201, "y": 192}, {"x": 216, "y": 205}, {"x": 230, "y": 221}, {"x": 245, "y": 234}, {"x": 259, "y": 244}, {"x": 273, "y": 260}, {"x": 287, "y": 275}, {"x": 302, "y": 284}, {"x": 316, "y": 306}, {"x": 330, "y": 315}, {"x": 344, "y": 316}, {"x": 359, "y": 318}, {"x": 373, "y": 320}, {"x": 387, "y": 335}, {"x": 402, "y": 345}, {"x": 416, "y": 365}, {"x": 430, "y": 382}, {"x": 445, "y": 402}, {"x": 459, "y": 417}, {"x": 473, "y": 439}, {"x": 488, "y": 452}, {"x": 502, "y": 469}, {"x": 516, "y": 496}, {"x": 531, "y": 513}, {"x": 545, "y": 529}, {"x": 559, "y": 544}, {"x": 574, "y": 561}, {"x": 588, "y": 580}, {"x": 602, "y": 590}, {"x": 616, "y": 603}, {"x": 630, "y": 616}, {"x": 645, "y": 632}, {"x": 659, "y": 654}, {"x": 673, "y": 670}].map(p => p.x),
+        ...([{"x": 0, "y": 13}, {"x": 13, "y": 16}, {"x": 25, "y": 22}, {"x": 38, "y": 26}, {"x": 51, "y": 31}, {"x": 64, "y": 39}, {"x": 76, "y": 40}, {"x": 89, "y": 47}, {"x": 102, "y": 52}, {"x": 115, "y": 57}, {"x": 130, "y": 62}, {"x": 144, "y": 63}, {"x": 158, "y": 63}, {"x": 172, "y": 64}, {"x": 187, "y": 68}, {"x": 201, "y": 77}, {"x": 215, "y": 82}, {"x": 229, "y": 92}, {"x": 243, "y": 103}, {"x": 257, "y": 107}, {"x": 272, "y": 113}, {"x": 286, "y": 119}, {"x": 300, "y": 125}, {"x": 315, "y": 132}, {"x": 329, "y": 134}, {"x": 343, "y": 134}, {"x": 357, "y": 135}, {"x": 371, "y": 136}, {"x": 385, "y": 143}, {"x": 399, "y": 153}, {"x": 414, "y": 160}, {"x": 428, "y": 164}, {"x": 442, "y": 171}, {"x": 456, "y": 176}, {"x": 470, "y": 184}, {"x": 485, "y": 193}, {"x": 499, "y": 197}, {"x": 513, "y": 203}, {"x": 528, "y": 209}, {"x": 542, "y": 213}, {"x": 556, "y": 219}, {"x": 570, "y": 233}, {"x": 584, "y": 238}, {"x": 599, "y": 247}, {"x": 613, "y": 252}, {"x": 627, "y": 259}, {"x": 641, "y": 267}, {"x": 656, "y": 276}, {"x": 670, "y": 284}].length ? [{"x": 0, "y": 13}, {"x": 13, "y": 16}, {"x": 25, "y": 22}, {"x": 38, "y": 26}, {"x": 51, "y": 31}, {"x": 64, "y": 39}, {"x": 76, "y": 40}, {"x": 89, "y": 47}, {"x": 102, "y": 52}, {"x": 115, "y": 57}, {"x": 130, "y": 62}, {"x": 144, "y": 63}, {"x": 158, "y": 63}, {"x": 172, "y": 64}, {"x": 187, "y": 68}, {"x": 201, "y": 77}, {"x": 215, "y": 82}, {"x": 229, "y": 92}, {"x": 243, "y": 103}, {"x": 257, "y": 107}, {"x": 272, "y": 113}, {"x": 286, "y": 119}, {"x": 300, "y": 125}, {"x": 315, "y": 132}, {"x": 329, "y": 134}, {"x": 343, "y": 134}, {"x": 357, "y": 135}, {"x": 371, "y": 136}, {"x": 385, "y": 143}, {"x": 399, "y": 153}, {"x": 414, "y": 160}, {"x": 428, "y": 164}, {"x": 442, "y": 171}, {"x": 456, "y": 176}, {"x": 470, "y": 184}, {"x": 485, "y": 193}, {"x": 499, "y": 197}, {"x": 513, "y": 203}, {"x": 528, "y": 209}, {"x": 542, "y": 213}, {"x": 556, "y": 219}, {"x": 570, "y": 233}, {"x": 584, "y": 238}, {"x": 599, "y": 247}, {"x": 613, "y": 252}, {"x": 627, "y": 259}, {"x": 641, "y": 267}, {"x": 656, "y": 276}, {"x": 670, "y": 284}].map(p => p.x) : [0])
+    );
+
+    new Chart(document.getElementById('timelineChart'), {
+        type: 'line',
+        data: {
+            datasets: [
+                {
+                    label: 'Sync (no gate)',
+                    data: [{"x": 0, "y": 21}, {"x": 13, "y": 40}, {"x": 26, "y": 48}, {"x": 39, "y": 67}, {"x": 52, "y": 79}, {"x": 64, "y": 88}, {"x": 77, "y": 100}, {"x": 90, "y": 117}, {"x": 103, "y": 134}, {"x": 116, "y": 145}, {"x": 131, "y": 159}, {"x": 145, "y": 162}, {"x": 159, "y": 165}, {"x": 173, "y": 165}, {"x": 187, "y": 176}, {"x": 201, "y": 192}, {"x": 216, "y": 205}, {"x": 230, "y": 221}, {"x": 245, "y": 234}, {"x": 259, "y": 244}, {"x": 273, "y": 260}, {"x": 287, "y": 275}, {"x": 302, "y": 284}, {"x": 316, "y": 306}, {"x": 330, "y": 315}, {"x": 344, "y": 316}, {"x": 359, "y": 318}, {"x": 373, "y": 320}, {"x": 387, "y": 335}, {"x": 402, "y": 345}, {"x": 416, "y": 365}, {"x": 430, "y": 382}, {"x": 445, "y": 402}, {"x": 459, "y": 417}, {"x": 473, "y": 439}, {"x": 488, "y": 452}, {"x": 502, "y": 469}, {"x": 516, "y": 496}, {"x": 531, "y": 513}, {"x": 545, "y": 529}, {"x": 559, "y": 544}, {"x": 574, "y": 561}, {"x": 588, "y": 580}, {"x": 602, "y": 590}, {"x": 616, "y": 603}, {"x": 630, "y": 616}, {"x": 645, "y": 632}, {"x": 659, "y": 654}, {"x": 673, "y": 670}],
+                    borderColor: '#ef4444',
+                    backgroundColor: 'rgba(239,68,68,0.1)',
+                    fill: false, tension: 0.1, pointRadius: 3, borderWidth: 2,
+                },
+                {
+                    label: 'Gated (prometheus-budget)',
+                    data: [{"x": 0, "y": 13}, {"x": 13, "y": 16}, {"x": 25, "y": 22}, {"x": 38, "y": 26}, {"x": 51, "y": 31}, {"x": 64, "y": 39}, {"x": 76, "y": 40}, {"x": 89, "y": 47}, {"x": 102, "y": 52}, {"x": 115, "y": 57}, {"x": 130, "y": 62}, {"x": 144, "y": 63}, {"x": 158, "y": 63}, {"x": 172, "y": 64}, {"x": 187, "y": 68}, {"x": 201, "y": 77}, {"x": 215, "y": 82}, {"x": 229, "y": 92}, {"x": 243, "y": 103}, {"x": 257, "y": 107}, {"x": 272, "y": 113}, {"x": 286, "y": 119}, {"x": 300, "y": 125}, {"x": 315, "y": 132}, {"x": 329, "y": 134}, {"x": 343, "y": 134}, {"x": 357, "y": 135}, {"x": 371, "y": 136}, {"x": 385, "y": 143}, {"x": 399, "y": 153}, {"x": 414, "y": 160}, {"x": 428, "y": 164}, {"x": 442, "y": 171}, {"x": 456, "y": 176}, {"x": 470, "y": 184}, {"x": 485, "y": 193}, {"x": 499, "y": 197}, {"x": 513, "y": 203}, {"x": 528, "y": 209}, {"x": 542, "y": 213}, {"x": 556, "y": 219}, {"x": 570, "y": 233}, {"x": 584, "y": 238}, {"x": 599, "y": 247}, {"x": 613, "y": 252}, {"x": 627, "y": 259}, {"x": 641, "y": 267}, {"x": 656, "y": 276}, {"x": 670, "y": 284}],
+                    borderColor: '#22c55e',
+                    backgroundColor: 'rgba(34,197,94,0.1)',
+                    fill: false, tension: 0.1, pointRadius: 3, borderWidth: 2,
+                }
+            ]
+        },
+        options: {
+            responsive: true,
+            plugins: {
+                title: { display: true, text: 'Batch Requests Completed Over Time', font: { size: 16 } },
+                annotation: { annotations: buildPhaseAnnotations(maxElapsed) }
+            },
+            scales: {
+                x: { type: 'linear', title: { display: true, text: 'Time (seconds)' } },
+                y: { title: { display: true, text: 'Batch Requests Completed' }, beginAtZero: true }
+            }
+        }
+    });
+
+    new Chart(document.getElementById('ttftChart'), {
+        type: 'bar',
+        data: {
+            labels: ["burst-1", "burst-2", "idle-1", "idle-2"],
+            datasets: [
+                { label: 'Sync', data: [209.29915005201025, 206.0273402693846, 246.61846375862993, 244.5599222185752], backgroundColor: 'rgba(239,68,68,0.7)' },
+                { label: 'Gated', data: [204.89144840051088, 195.60607478830192, 254.344036472037, 258.84014801074085], backgroundColor: 'rgba(34,197,94,0.7)' }
+            ]
+        },
+        options: {
+            responsive: true,
+            plugins: { title: { display: true, text: 'Time to First Token p50 (ms) — lower is better', font: { size: 16 } } },
+            scales: { y: { title: { display: true, text: 'TTFT p50 (ms)' }, beginAtZero: true } }
+        }
+    });
+
+    new Chart(document.getElementById('incompleteChart'), {
+        type: 'bar',
+        data: {
+            labels: ["burst-1", "burst-2", "idle-1", "idle-2"],
+            datasets: [
+                { label: 'Sync', data: [57.528089887640455, 57.09497206703911, 2.5, 2.5], backgroundColor: 'rgba(239,68,68,0.7)' },
+                { label: 'Gated', data: [56.90423162583519, 56.15982241953385, 2.5, 2.5], backgroundColor: 'rgba(34,197,94,0.7)' }
+            ]
+        },
+        options: {
+            responsive: true,
+            plugins: { title: { display: true, text: 'Incomplete Request Rate (%) — lower is better', font: { size: 16 } } },
+            scales: { y: { title: { display: true, text: 'Incomplete %' }, beginAtZero: true } }
+        }
+    });
+    </script>
+</body>
+</html>

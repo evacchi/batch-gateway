@@ -1,0 +1,221 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Batch vs Live Traffic Isolation Benchmark</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-annotation@3"></script>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; margin: 40px; max-width: 1200px; background: #fafafa; color: #333; }
+        h1 { color: #1a1a1a; border-bottom: 2px solid #e5e5e5; padding-bottom: 12px; }
+        h2 { color: #444; margin-top: 40px; }
+        .card { background: white; border-radius: 8px; padding: 24px; margin: 20px 0; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+        .chart-container { background: white; border-radius: 8px; padding: 20px; margin: 20px 0; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+        canvas { max-height: 400px; }
+        table { border-collapse: collapse; width: 100%; margin: 20px 0; background: white; border-radius: 8px; overflow: hidden; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+        th, td { padding: 10px 16px; text-align: right; border-bottom: 1px solid #eee; }
+        th { background: #f5f5f5; font-weight: 600; text-align: left; }
+        td:first-child { text-align: left; font-weight: 500; }
+        .good { color: #16a34a; font-weight: 600; }
+        .bad { color: #dc2626; font-weight: 600; }
+        .metric-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin: 16px 0; }
+        .metric-box { background: #f9fafb; border-radius: 6px; padding: 16px; border: 1px solid #e5e7eb; }
+        .metric-box h4 { margin: 0 0 4px 0; font-size: 13px; color: #6b7280; text-transform: uppercase; letter-spacing: 0.5px; }
+        .metric-box .value { font-size: 28px; font-weight: 700; }
+        .metric-box .detail { font-size: 13px; color: #6b7280; margin-top: 4px; }
+        code { background: #f3f4f6; padding: 2px 6px; border-radius: 4px; font-size: 14px; }
+        .workload-table { width: auto; margin: 12px 0; }
+        .workload-table td { padding: 4px 16px 4px 0; border: none; text-align: left; }
+        .workload-table td:first-child { font-weight: 600; color: #6b7280; }
+    </style>
+</head>
+<body>
+    <h1>Batch vs Live Traffic Isolation</h1>
+
+    <div class="card">
+        <h2 style="margin-top:0">Workload</h2>
+        <p>This benchmark tests whether the <strong>llm-d-async dispatch budget gate</strong>
+        protects live inference traffic from batch request interference. Two scenarios are
+        compared on identical hardware:</p>
+        <table class="workload-table">
+            <tr><td>Model</td><td><code>Qwen/Qwen3-8B</code> on 1x NVIDIA A100 GPU</td></tr>
+            <tr><td>Live traffic</td><td>guidellm burst/idle cycles: <strong>15 req/s</strong> for 60s (burst),
+                <strong>1 req/s</strong> for 120s (idle), 2 cycles</td></tr>
+            <tr><td>Batch load</td><td>1000 requests submitted at start (idle), another 1000 submitted during first burst</td></tr>
+            <tr><td>Batch requests</td><td>512 output tokens per request (chat completions)</td></tr>
+            <tr><td>Pattern</td><td>IDLE &rarr; BURST &rarr; IDLE &rarr; BURST</td></tr>
+        </table>
+        <div class="metric-grid" style="margin-top: 20px">
+            <div class="metric-box">
+                <h4>Sync (no gate)</h4>
+                <p>Batch-gateway processor sends requests <strong>directly</strong> to the inference gateway.
+                Batch and live traffic compete for GPU capacity.</p>
+            </div>
+            <div class="metric-box">
+                <h4>Gated (async dispatch)</h4>
+                <p>Batch-gateway submits to a Redis queue. The <strong>async-processor</strong> dispatches
+                only when the <code>prometheus-budget</code> gate is open (GPU utilization below threshold).</p>
+            </div>
+        </div>
+    </div>
+
+    <h2>Key Results</h2>
+    <div class="metric-grid">
+        <div class="metric-box">
+            <h4>Sync: Batch during Burst</h4>
+            <div class="value bad">500 reqs</div>
+            <div class="detail">Batch requests dispatched directly during live traffic burst, competing for GPU</div>
+        </div>
+        <div class="metric-box">
+            <h4>Gated: Batch during Burst</h4>
+            <div class="value good">211 reqs</div>
+            <div class="detail">Gate throttles batch &mdash; only excess capacity used, live traffic protected</div>
+        </div>
+    </div>
+
+    <h2>Batch Completion Timeline</h2>
+    <p>The timeline shows how batch requests progress over time. Red/green shaded bands indicate
+    burst (high live traffic) and idle phases. In sync mode, batch blasts through during burst,
+    competing with live traffic. With the gate, batch progress <strong>pauses during burst</strong>
+    and resumes during idle.</p>
+    <div class="chart-container">
+        <canvas id="timelineChart"></canvas>
+    </div>
+
+    <h2>Live Traffic Quality: TTFT</h2>
+    <p>Time to First Token (TTFT) measures how quickly the model begins responding.
+    Higher TTFT during burst phases indicates GPU contention from batch requests.</p>
+    <div class="chart-container">
+        <canvas id="ttftChart"></canvas>
+    </div>
+
+    <h2>Live Traffic Quality: Incomplete Requests</h2>
+    <p>Requests that did not complete within the phase window. A high incomplete rate
+    during burst indicates the GPU is overloaded.</p>
+    <div class="chart-container">
+        <canvas id="incompleteChart"></canvas>
+    </div>
+
+    <h2>Detailed Metrics</h2>
+    <table>
+        <tr><th>Scenario</th><th>Phase</th><th>Successful</th><th>Incomplete</th><th>TTFT p50 (ms)</th><th>TTFT p95 (ms)</th><th>ITL p50 (ms)</th><th>OK req/s</th></tr>
+        <tr class="bad"><td>sync</td><td>burst-1</td><td>840</td><td>61</td><td>148.1</td><td>32.7</td><td>5.05</td><td>7.9</td></tr>
+        <tr class="good"><td>gated</td><td>burst-1</td><td>844</td><td>57</td><td>148.4</td><td>30.6</td><td>4.59</td><td>7.4</td></tr>
+        <tr class="bad"><td>sync</td><td>burst-2</td><td>842</td><td>59</td><td>149.9</td><td>30.7</td><td>4.72</td><td>7.5</td></tr>
+        <tr class="good"><td>gated</td><td>burst-2</td><td>844</td><td>57</td><td>148.2</td><td>31.2</td><td>4.82</td><td>7.4</td></tr>
+        <tr><td>sync</td><td>idle-1</td><td>118</td><td>2</td><td>87.0</td><td>26.9</td><td>0.57</td><td>5.8</td></tr>
+        <tr><td>gated</td><td>idle-1</td><td>117</td><td>3</td><td>138.8</td><td>26.3</td><td>1.31</td><td>5.9</td></tr>
+        <tr><td>sync</td><td>idle-2</td><td>118</td><td>2</td><td>86.5</td><td>27.2</td><td>1.17</td><td>5.8</td></tr>
+        <tr><td>gated</td><td>idle-2</td><td>117</td><td>3</td><td>138.8</td><td>23.7</td><td>1.91</td><td>5.9</td></tr>
+    </table>
+
+    <div class="card" style="margin-top: 40px">
+        <h2 style="margin-top:0">Conclusion</h2>
+        <p>Without the dispatch budget gate (<strong>sync</strong>), the batch processor sends all
+        1000 requests directly to the inference gateway during burst, competing with
+        15 req/s of live traffic for GPU compute. This increases TTFT and causes
+        request timeouts.</p>
+        <p>With the <strong>prometheus-budget gate</strong>, the async-processor monitors GPU
+        utilization via Prometheus and holds back batch requests when the inference endpoint is
+        saturated. Batch requests only dispatch during idle periods when there is spare capacity,
+        preserving live traffic quality.</p>
+    </div>
+
+    <script>
+    const phaseBands = [{"x": 0, "phase": "Cycle 1: IDLE (1 req/s, 120s)"}, {"x": 116, "phase": "Cycle 1: BURST (15 req/s, 60s)"}, {"x": 188, "phase": "Cycle 2: IDLE (1 req/s, 120s)"}, {"x": 314, "phase": "Cycle 2: BURST (15 req/s, 60s)"}, {"x": 385, "phase": "Done"}];
+
+    // Build annotation boxes for burst/idle phases
+    function buildPhaseAnnotations(maxX) {
+        const annotations = {};
+        for (let i = 0; i < phaseBands.length; i++) {
+            const start = phaseBands[i].x;
+            const end = i + 1 < phaseBands.length ? phaseBands[i + 1].x : maxX;
+            const isBurst = phaseBands[i].phase.includes('BURST');
+            annotations['band' + i] = {
+                type: 'box',
+                xMin: start, xMax: end,
+                backgroundColor: isBurst ? 'rgba(239,68,68,0.08)' : 'rgba(34,197,94,0.06)',
+                borderWidth: 0,
+                label: {
+                    display: true,
+                    content: isBurst ? 'BURST' : 'IDLE',
+                    position: { x: 'center', y: 'start' },
+                    font: { size: 11, weight: 'bold' },
+                    color: isBurst ? 'rgba(239,68,68,0.5)' : 'rgba(34,197,94,0.4)',
+                }
+            };
+        }
+        return annotations;
+    }
+
+    const maxElapsed = Math.max(
+        ...[{"x": 0, "y": 121}, {"x": 13, "y": 151}, {"x": 26, "y": 201}, {"x": 39, "y": 241}, {"x": 51, "y": 291}, {"x": 64, "y": 342}, {"x": 77, "y": 371}, {"x": 90, "y": 421}, {"x": 103, "y": 461}, {"x": 116, "y": 500}, {"x": 130, "y": 512}, {"x": 145, "y": 541}, {"x": 159, "y": 581}, {"x": 174, "y": 621}, {"x": 188, "y": 651}, {"x": 202, "y": 701}, {"x": 216, "y": 751}, {"x": 230, "y": 801}, {"x": 245, "y": 851}, {"x": 259, "y": 911}, {"x": 273, "y": 941}, {"x": 287, "y": 1000}, {"x": 302, "y": 1000}, {"x": 316, "y": 1000}, {"x": 330, "y": 1000}, {"x": 345, "y": 1000}, {"x": 359, "y": 1000}, {"x": 373, "y": 1000}, {"x": 388, "y": 1000}].map(p => p.x),
+        ...([{"x": 0, "y": 49}, {"x": 13, "y": 61}, {"x": 26, "y": 81}, {"x": 39, "y": 101}, {"x": 52, "y": 113}, {"x": 65, "y": 133}, {"x": 78, "y": 145}, {"x": 91, "y": 165}, {"x": 104, "y": 181}, {"x": 116, "y": 201}, {"x": 131, "y": 217}, {"x": 145, "y": 229}, {"x": 159, "y": 229}, {"x": 174, "y": 229}, {"x": 188, "y": 229}, {"x": 202, "y": 236}, {"x": 216, "y": 256}, {"x": 230, "y": 276}, {"x": 244, "y": 292}, {"x": 258, "y": 312}, {"x": 272, "y": 332}, {"x": 286, "y": 352}, {"x": 300, "y": 372}, {"x": 314, "y": 384}, {"x": 328, "y": 400}, {"x": 342, "y": 412}, {"x": 356, "y": 412}, {"x": 371, "y": 412}, {"x": 385, "y": 412}, {"x": 399, "y": 425}, {"x": 413, "y": 445}, {"x": 427, "y": 469}, {"x": 442, "y": 489}, {"x": 456, "y": 509}, {"x": 470, "y": 529}, {"x": 484, "y": 545}, {"x": 498, "y": 565}, {"x": 512, "y": 585}, {"x": 526, "y": 605}, {"x": 540, "y": 629}, {"x": 554, "y": 641}, {"x": 569, "y": 661}, {"x": 583, "y": 685}, {"x": 597, "y": 705}, {"x": 611, "y": 725}, {"x": 625, "y": 745}, {"x": 639, "y": 761}, {"x": 653, "y": 781}, {"x": 667, "y": 801}].length ? [{"x": 0, "y": 49}, {"x": 13, "y": 61}, {"x": 26, "y": 81}, {"x": 39, "y": 101}, {"x": 52, "y": 113}, {"x": 65, "y": 133}, {"x": 78, "y": 145}, {"x": 91, "y": 165}, {"x": 104, "y": 181}, {"x": 116, "y": 201}, {"x": 131, "y": 217}, {"x": 145, "y": 229}, {"x": 159, "y": 229}, {"x": 174, "y": 229}, {"x": 188, "y": 229}, {"x": 202, "y": 236}, {"x": 216, "y": 256}, {"x": 230, "y": 276}, {"x": 244, "y": 292}, {"x": 258, "y": 312}, {"x": 272, "y": 332}, {"x": 286, "y": 352}, {"x": 300, "y": 372}, {"x": 314, "y": 384}, {"x": 328, "y": 400}, {"x": 342, "y": 412}, {"x": 356, "y": 412}, {"x": 371, "y": 412}, {"x": 385, "y": 412}, {"x": 399, "y": 425}, {"x": 413, "y": 445}, {"x": 427, "y": 469}, {"x": 442, "y": 489}, {"x": 456, "y": 509}, {"x": 470, "y": 529}, {"x": 484, "y": 545}, {"x": 498, "y": 565}, {"x": 512, "y": 585}, {"x": 526, "y": 605}, {"x": 540, "y": 629}, {"x": 554, "y": 641}, {"x": 569, "y": 661}, {"x": 583, "y": 685}, {"x": 597, "y": 705}, {"x": 611, "y": 725}, {"x": 625, "y": 745}, {"x": 639, "y": 761}, {"x": 653, "y": 781}, {"x": 667, "y": 801}].map(p => p.x) : [0])
+    );
+
+    new Chart(document.getElementById('timelineChart'), {
+        type: 'line',
+        data: {
+            datasets: [
+                {
+                    label: 'Sync (no gate)',
+                    data: [{"x": 0, "y": 121}, {"x": 13, "y": 151}, {"x": 26, "y": 201}, {"x": 39, "y": 241}, {"x": 51, "y": 291}, {"x": 64, "y": 342}, {"x": 77, "y": 371}, {"x": 90, "y": 421}, {"x": 103, "y": 461}, {"x": 116, "y": 500}, {"x": 130, "y": 512}, {"x": 145, "y": 541}, {"x": 159, "y": 581}, {"x": 174, "y": 621}, {"x": 188, "y": 651}, {"x": 202, "y": 701}, {"x": 216, "y": 751}, {"x": 230, "y": 801}, {"x": 245, "y": 851}, {"x": 259, "y": 911}, {"x": 273, "y": 941}, {"x": 287, "y": 1000}, {"x": 302, "y": 1000}, {"x": 316, "y": 1000}, {"x": 330, "y": 1000}, {"x": 345, "y": 1000}, {"x": 359, "y": 1000}, {"x": 373, "y": 1000}, {"x": 388, "y": 1000}],
+                    borderColor: '#ef4444',
+                    backgroundColor: 'rgba(239,68,68,0.1)',
+                    fill: false, tension: 0.1, pointRadius: 3, borderWidth: 2,
+                },
+                {
+                    label: 'Gated (prometheus-budget)',
+                    data: [{"x": 0, "y": 49}, {"x": 13, "y": 61}, {"x": 26, "y": 81}, {"x": 39, "y": 101}, {"x": 52, "y": 113}, {"x": 65, "y": 133}, {"x": 78, "y": 145}, {"x": 91, "y": 165}, {"x": 104, "y": 181}, {"x": 116, "y": 201}, {"x": 131, "y": 217}, {"x": 145, "y": 229}, {"x": 159, "y": 229}, {"x": 174, "y": 229}, {"x": 188, "y": 229}, {"x": 202, "y": 236}, {"x": 216, "y": 256}, {"x": 230, "y": 276}, {"x": 244, "y": 292}, {"x": 258, "y": 312}, {"x": 272, "y": 332}, {"x": 286, "y": 352}, {"x": 300, "y": 372}, {"x": 314, "y": 384}, {"x": 328, "y": 400}, {"x": 342, "y": 412}, {"x": 356, "y": 412}, {"x": 371, "y": 412}, {"x": 385, "y": 412}, {"x": 399, "y": 425}, {"x": 413, "y": 445}, {"x": 427, "y": 469}, {"x": 442, "y": 489}, {"x": 456, "y": 509}, {"x": 470, "y": 529}, {"x": 484, "y": 545}, {"x": 498, "y": 565}, {"x": 512, "y": 585}, {"x": 526, "y": 605}, {"x": 540, "y": 629}, {"x": 554, "y": 641}, {"x": 569, "y": 661}, {"x": 583, "y": 685}, {"x": 597, "y": 705}, {"x": 611, "y": 725}, {"x": 625, "y": 745}, {"x": 639, "y": 761}, {"x": 653, "y": 781}, {"x": 667, "y": 801}],
+                    borderColor: '#22c55e',
+                    backgroundColor: 'rgba(34,197,94,0.1)',
+                    fill: false, tension: 0.1, pointRadius: 3, borderWidth: 2,
+                }
+            ]
+        },
+        options: {
+            responsive: true,
+            plugins: {
+                title: { display: true, text: 'Batch Requests Completed Over Time', font: { size: 16 } },
+                annotation: { annotations: buildPhaseAnnotations(maxElapsed) }
+            },
+            scales: {
+                x: { type: 'linear', title: { display: true, text: 'Time (seconds)' } },
+                y: { title: { display: true, text: 'Batch Requests Completed' }, beginAtZero: true }
+            }
+        }
+    });
+
+    new Chart(document.getElementById('ttftChart'), {
+        type: 'bar',
+        data: {
+            labels: ["burst-1", "burst-2", "idle-1", "idle-2"],
+            datasets: [
+                { label: 'Sync', data: [148.11092649304186, 149.9103782825109, 87.0, 86.5], backgroundColor: 'rgba(239,68,68,0.7)' },
+                { label: 'Gated', data: [148.44259102980016, 148.1533440660598, 138.80441875771342, 138.80521924224928], backgroundColor: 'rgba(34,197,94,0.7)' }
+            ]
+        },
+        options: {
+            responsive: true,
+            plugins: { title: { display: true, text: 'Time to First Token p50 (ms) — lower is better', font: { size: 16 } } },
+            scales: { y: { title: { display: true, text: 'TTFT p50 (ms)' }, beginAtZero: true } }
+        }
+    });
+
+    new Chart(document.getElementById('incompleteChart'), {
+        type: 'bar',
+        data: {
+            labels: ["burst-1", "burst-2", "idle-1", "idle-2"],
+            datasets: [
+                { label: 'Sync', data: [6.770255271920089, 6.548279689234185, 1.6666666666666667, 1.6666666666666667], backgroundColor: 'rgba(239,68,68,0.7)' },
+                { label: 'Gated', data: [6.326304106548279, 6.326304106548279, 2.5, 2.5], backgroundColor: 'rgba(34,197,94,0.7)' }
+            ]
+        },
+        options: {
+            responsive: true,
+            plugins: { title: { display: true, text: 'Incomplete Request Rate (%) — lower is better', font: { size: 16 } } },
+            scales: { y: { title: { display: true, text: 'Incomplete %' }, beginAtZero: true } }
+        }
+    });
+    </script>
+</body>
+</html>

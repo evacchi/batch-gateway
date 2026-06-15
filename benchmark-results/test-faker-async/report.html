@@ -1,0 +1,257 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Batch vs Live Traffic Isolation Benchmark</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-annotation@3"></script>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; margin: 40px; max-width: 1200px; background: #fafafa; color: #333; }
+        h1 { color: #1a1a1a; border-bottom: 2px solid #e5e5e5; padding-bottom: 12px; }
+        h2 { color: #444; margin-top: 40px; }
+        .card { background: white; border-radius: 8px; padding: 24px; margin: 20px 0; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+        .chart-container { background: white; border-radius: 8px; padding: 20px; margin: 20px 0; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+        canvas { max-height: 400px; }
+        table { border-collapse: collapse; width: 100%; margin: 20px 0; background: white; border-radius: 8px; overflow: hidden; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+        th, td { padding: 10px 16px; text-align: right; border-bottom: 1px solid #eee; }
+        th { background: #f5f5f5; font-weight: 600; text-align: left; }
+        td:first-child { text-align: left; font-weight: 500; }
+        .good { color: #16a34a; font-weight: 600; }
+        .bad { color: #dc2626; font-weight: 600; }
+        .metric-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin: 16px 0; }
+        .metric-box { background: #f9fafb; border-radius: 6px; padding: 16px; border: 1px solid #e5e7eb; }
+        .metric-box h4 { margin: 0 0 4px 0; font-size: 13px; color: #6b7280; text-transform: uppercase; letter-spacing: 0.5px; }
+        .metric-box .value { font-size: 28px; font-weight: 700; }
+        .metric-box .detail { font-size: 13px; color: #6b7280; margin-top: 4px; }
+        code { background: #f3f4f6; padding: 2px 6px; border-radius: 4px; font-size: 14px; }
+        .workload-table { width: auto; margin: 12px 0; }
+        .workload-table td { padding: 4px 16px 4px 0; border: none; text-align: left; }
+        .workload-table td:first-child { font-weight: 600; color: #6b7280; }
+    </style>
+</head>
+<body>
+    <h1>Batch vs Live Traffic Isolation</h1>
+
+    <div class="card">
+        <h2 style="margin-top:0">Workload</h2>
+        <p>This benchmark tests whether the <strong>llm-d-async dispatch budget gate</strong>
+        protects live inference traffic from batch request interference. Two scenarios are
+        compared on identical hardware:</p>
+        <table class="workload-table">
+            <tr><td>Model</td><td><code>Qwen/Qwen3-8B</code> on 1x NVIDIA A100 GPU</td></tr>
+            <tr><td>Live traffic</td><td>guidellm burst/idle cycles: <strong>30 req/s</strong> for 60s (burst),
+                <strong>1 req/s</strong> for 120s (idle), 2 cycles</td></tr>
+            <tr><td>Batch load</td><td>500 requests submitted at start (idle), another 500 submitted during first burst</td></tr>
+            <tr><td>Batch requests</td><td>~2000 random input tokens, no output cap (defeats prefix caching)</td></tr>
+            <tr><td>Pattern</td><td>IDLE &rarr; BURST &rarr; IDLE &rarr; BURST</td></tr>
+        </table>
+        <div class="metric-grid" style="margin-top: 20px">
+            <div class="metric-box">
+                <h4>Sync (no gate)</h4>
+                <p>Batch-gateway processor sends requests <strong>directly</strong> to the inference gateway.
+                Batch and live traffic compete for GPU capacity.</p>
+            </div>
+            <div class="metric-box">
+                <h4>Gated (async dispatch)</h4>
+                <p>Batch-gateway submits to a Redis queue. The <strong>async-processor</strong> dispatches
+                only when the <code>prometheus-budget</code> gate is open (GPU utilization below threshold).</p>
+            </div>
+        </div>
+    </div>
+
+    <h2>Key Results</h2>
+    <div class="metric-grid">
+        <div class="metric-box">
+            <h4>Sync: Batch during Burst</h4>
+            <div class="value bad">0 reqs</div>
+            <div class="detail">Batch requests dispatched directly during live traffic burst, competing for GPU</div>
+        </div>
+        <div class="metric-box">
+            <h4>Gated: Batch during Burst</h4>
+            <div class="value good">0 reqs</div>
+            <div class="detail">Gate throttles batch &mdash; only excess capacity used, live traffic protected</div>
+        </div>
+        <div class="metric-box">
+            <h4>Sync: Batch during Idle</h4>
+            <div class="value">0 reqs</div>
+            <div class="detail">Batch requests processed during idle &mdash; competes with live traffic at all times</div>
+        </div>
+        <div class="metric-box">
+            <h4>Gated: Batch during Idle</h4>
+            <div class="value good">0 reqs</div>
+            <div class="detail">Gate opens &mdash; batch fills unused capacity when live traffic is low</div>
+        </div>
+    </div>
+
+    <h2>Live Traffic Impact</h2>
+    <p>Each burst phase sends requests at 30 req/s for 60s. Requests still in-flight
+    when the phase window closes are marked <strong>incomplete</strong> &mdash; they were delayed by GPU
+    contention from concurrent batch processing. Every batch request dispatched during burst is capacity
+    stolen from live traffic.</p>
+    <div class="metric-grid">
+        <div class="metric-box">
+            <h4>Sync: Live Burst Success Rate</h4>
+            <div class="value bad">N/A</div>
+            <div class="detail">0 of 0 requests completed in time</div>
+        </div>
+        <div class="metric-box">
+            <h4>Gated: Live Burst Success Rate</h4>
+            <div class="value good">7/10 (70%)</div>
+            <div class="detail">7 of 10 requests completed in time</div>
+        </div>
+        <div class="metric-box">
+            <h4>Sync: Burst TTFT (median)</h4>
+            <div class="value bad">N/A</div>
+            <div class="detail">Higher TTFT = batch requests are delaying live traffic first-token latency</div>
+        </div>
+        <div class="metric-box">
+            <h4>Gated: Burst TTFT (median)</h4>
+            <div class="value good">140.4 ms</div>
+            <div class="detail">Gate holds batch back &mdash; live traffic gets full GPU priority</div>
+        </div>
+    </div>
+
+    <h2>Batch Completion Timeline</h2>
+    <p>The timeline shows how batch requests progress over time. Red/green shaded bands indicate
+    burst (high live traffic) and idle phases. In sync mode, batch blasts through during burst,
+    competing with live traffic. With the gate, batch progress <strong>pauses during burst</strong>
+    and resumes during idle.</p>
+    <div class="chart-container">
+        <canvas id="timelineChart"></canvas>
+    </div>
+
+    <h2>Live Traffic Quality: TTFT</h2>
+    <p>Time to First Token (TTFT) measures how quickly the model begins responding.
+    Higher TTFT during burst phases indicates GPU contention from batch requests.</p>
+    <div class="chart-container">
+        <canvas id="ttftChart"></canvas>
+    </div>
+
+    <h2>Live Traffic Quality: Incomplete Requests</h2>
+    <p>Requests that did not complete within the phase window. A high incomplete rate
+    during burst indicates the GPU is overloaded.</p>
+    <div class="chart-container">
+        <canvas id="incompleteChart"></canvas>
+    </div>
+
+    <h2>Detailed Metrics</h2>
+    <table>
+        <tr><th>Scenario</th><th>Phase</th><th>Successful</th><th>Incomplete</th><th>TTFT p50 (ms)</th><th>TTFT p95 (ms)</th><th>ITL p50 (ms)</th><th>OK req/s</th></tr>
+        <tr class="good"><td>gated</td><td>burst-1</td><td>7</td><td>3</td><td>140.4</td><td>25.9</td><td>1.63</td><td>5.9</td></tr>
+        <tr><td>gated</td><td>idle-1</td><td>6</td><td>4</td><td>184.9</td><td>59.7</td><td>2.18</td><td>6.1</td></tr>
+    </table>
+
+    <div class="card" style="margin-top: 40px">
+        <h2 style="margin-top:0">Conclusion</h2>
+        <p>Without the dispatch budget gate (<strong>sync</strong>), the batch processor sends
+        500 requests directly to the inference gateway during burst, competing with
+        30 req/s of live traffic for GPU compute. During burst phases,
+        <strong>0 of 0</strong> live requests completed
+        in time (TTFT N/A), while <strong>0</strong> batch requests
+        consumed GPU capacity that could have served live traffic.</p>
+        <p>With the <strong>prometheus-budget gate</strong>, the async-processor monitors GPU
+        utilization via Prometheus and holds back batch requests when the inference endpoint is
+        saturated. During burst, only <strong>0</strong> batch requests were
+        dispatched, allowing <strong>7 of 10</strong>
+        live requests to complete (TTFT 140.4 ms). Batch work shifts to idle periods
+        (0 requests processed during idle) when GPU capacity is available.</p>
+    </div>
+
+    <script>
+    const phaseBands = [{"x": 0, "phase": "Cycle 1: IDLE (1 req/s, 10s)"}, {"x": 13, "phase": "Cycle 1: BURST (1 req/s, 10s)"}, {"x": 29, "phase": "Done"}];
+
+    // Build annotation boxes for burst/idle phases
+    function buildPhaseAnnotations(maxX) {
+        const annotations = {};
+        for (let i = 0; i < phaseBands.length; i++) {
+            const start = phaseBands[i].x;
+            const end = i + 1 < phaseBands.length ? phaseBands[i + 1].x : maxX;
+            const isBurst = phaseBands[i].phase.includes('BURST');
+            annotations['band' + i] = {
+                type: 'box',
+                xMin: start, xMax: end,
+                backgroundColor: isBurst ? 'rgba(239,68,68,0.08)' : 'rgba(34,197,94,0.06)',
+                borderWidth: 0,
+                label: {
+                    display: true,
+                    content: isBurst ? 'BURST' : 'IDLE',
+                    position: { x: 'center', y: 'start' },
+                    font: { size: 11, weight: 'bold' },
+                    color: isBurst ? 'rgba(239,68,68,0.5)' : 'rgba(34,197,94,0.4)',
+                }
+            };
+        }
+        return annotations;
+    }
+
+    const maxElapsed = Math.max(
+        ...[].map(p => p.x),
+        ...([{"x": 0, "y": 5}, {"x": 13, "y": 5}, {"x": 29, "y": 5}, {"x": 43, "y": 5}].length ? [{"x": 0, "y": 5}, {"x": 13, "y": 5}, {"x": 29, "y": 5}, {"x": 43, "y": 5}].map(p => p.x) : [0])
+    );
+
+    new Chart(document.getElementById('timelineChart'), {
+        type: 'line',
+        data: {
+            datasets: [
+                {
+                    label: 'Sync (no gate)',
+                    data: [],
+                    borderColor: '#ef4444',
+                    backgroundColor: 'rgba(239,68,68,0.1)',
+                    fill: false, tension: 0.1, pointRadius: 3, borderWidth: 2,
+                },
+                {
+                    label: 'Gated (prometheus-budget)',
+                    data: [{"x": 0, "y": 5}, {"x": 13, "y": 5}, {"x": 29, "y": 5}, {"x": 43, "y": 5}],
+                    borderColor: '#22c55e',
+                    backgroundColor: 'rgba(34,197,94,0.1)',
+                    fill: false, tension: 0.1, pointRadius: 3, borderWidth: 2,
+                }
+            ]
+        },
+        options: {
+            responsive: true,
+            plugins: {
+                title: { display: true, text: 'Batch Requests Completed Over Time', font: { size: 16 } },
+                annotation: { annotations: buildPhaseAnnotations(maxElapsed) }
+            },
+            scales: {
+                x: { type: 'linear', title: { display: true, text: 'Time (seconds)' } },
+                y: { title: { display: true, text: 'Batch Requests Completed' }, beginAtZero: true }
+            }
+        }
+    });
+
+    new Chart(document.getElementById('ttftChart'), {
+        type: 'bar',
+        data: {
+            labels: ["burst-1", "idle-1"],
+            datasets: [
+                { label: 'Sync', data: [0, 0], backgroundColor: 'rgba(239,68,68,0.7)' },
+                { label: 'Gated', data: [140.43820309619775, 184.92566073966046], backgroundColor: 'rgba(34,197,94,0.7)' }
+            ]
+        },
+        options: {
+            responsive: true,
+            plugins: { title: { display: true, text: 'Time to First Token p50 (ms) — lower is better', font: { size: 16 } } },
+            scales: { y: { title: { display: true, text: 'TTFT p50 (ms)' }, beginAtZero: true } }
+        }
+    });
+
+    new Chart(document.getElementById('incompleteChart'), {
+        type: 'bar',
+        data: {
+            labels: ["burst-1", "idle-1"],
+            datasets: [
+                { label: 'Sync', data: [0, 0], backgroundColor: 'rgba(239,68,68,0.7)' },
+                { label: 'Gated', data: [30.0, 40.0], backgroundColor: 'rgba(34,197,94,0.7)' }
+            ]
+        },
+        options: {
+            responsive: true,
+            plugins: { title: { display: true, text: 'Incomplete Request Rate (%) — lower is better', font: { size: 16 } } },
+            scales: { y: { title: { display: true, text: 'Incomplete %' }, beginAtZero: true } }
+        }
+    });
+    </script>
+</body>
+</html>

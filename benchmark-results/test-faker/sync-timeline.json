@@ -1,0 +1,158 @@
+[
+  {
+    "elapsed": 0,
+    "completed": 5,
+    "total": 5,
+    "phase": "unknown"
+  },
+  {
+    "elapsed": 13,
+    "completed": 5,
+    "total": 5,
+    "phase": "unknown"
+  },
+  {
+    "elapsed": 26,
+    "completed": 5,
+    "total": 5,
+    "phase": "unknown"
+  },
+  {
+    "elapsed": 39,
+    "completed": 5,
+    "total": 5,
+    "phase": "unknown"
+  },
+  {
+    "elapsed": 52,
+    "completed": 5,
+    "total": 5,
+    "phase": "unknown"
+  },
+  {
+    "elapsed": 65,
+    "completed": 5,
+    "total": 5,
+    "phase": "unknown"
+  },
+  {
+    "elapsed": 78,
+    "completed": 5,
+    "total": 5,
+    "phase": "unknown"
+  },
+  {
+    "elapsed": 91,
+    "completed": 5,
+    "total": 5,
+    "phase": "unknown"
+  },
+  {
+    "elapsed": 104,
+    "completed": 5,
+    "total": 5,
+    "phase": "unknown"
+  },
+  {
+    "elapsed": 117,
+    "completed": 5,
+    "total": 5,
+    "phase": "unknown"
+  },
+  {
+    "elapsed": 130,
+    "completed": 5,
+    "total": 5,
+    "phase": "unknown"
+  },
+  {
+    "elapsed": 143,
+    "completed": 5,
+    "total": 5,
+    "phase": "unknown"
+  },
+  {
+    "elapsed": 156,
+    "completed": 5,
+    "total": 5,
+    "phase": "unknown"
+  },
+  {
+    "elapsed": 169,
+    "completed": 5,
+    "total": 5,
+    "phase": "unknown"
+  },
+  {
+    "elapsed": 182,
+    "completed": 5,
+    "total": 5,
+    "phase": "unknown"
+  },
+  {
+    "elapsed": 195,
+    "completed": 5,
+    "total": 5,
+    "phase": "unknown"
+  },
+  {
+    "elapsed": 208,
+    "completed": 5,
+    "total": 5,
+    "phase": "unknown"
+  },
+  {
+    "elapsed": 220,
+    "completed": 5,
+    "total": 5,
+    "phase": "unknown"
+  },
+  {
+    "elapsed": 233,
+    "completed": 5,
+    "total": 5,
+    "phase": "unknown"
+  },
+  {
+    "elapsed": 246,
+    "completed": 5,
+    "total": 5,
+    "phase": "unknown"
+  },
+  {
+    "elapsed": 259,
+    "completed": 5,
+    "total": 5,
+    "phase": "unknown"
+  },
+  {
+    "elapsed": 272,
+    "completed": 5,
+    "total": 5,
+    "phase": "unknown"
+  },
+  {
+    "elapsed": 284,
+    "completed": 5,
+    "total": 5,
+    "phase": "Cycle 1: IDLE (1 req/s, 10s)"
+  },
+  {
+    "elapsed": 297,
+    "completed": 5,
+    "total": 5,
+    "phase": "Cycle 1: IDLE (1 req/s, 10s)"
+  },
+  {
+    "elapsed": 310,
+    "completed": 5,
+    "total": 5,
+    "phase": "Cycle 1: BURST (1 req/s, 10s)"
+  },
+  {
+    "elapsed": 326,
+    "completed": 5,
+    "total": 5,
+    "phase": "Done"
+  }
+]

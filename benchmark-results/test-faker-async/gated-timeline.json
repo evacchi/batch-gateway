@@ -1,0 +1,26 @@
+[
+  {
+    "elapsed": 0,
+    "completed": 5,
+    "total": 5,
+    "phase": "Cycle 1: IDLE (1 req/s, 10s)"
+  },
+  {
+    "elapsed": 13,
+    "completed": 5,
+    "total": 5,
+    "phase": "Cycle 1: BURST (1 req/s, 10s)"
+  },
+  {
+    "elapsed": 29,
+    "completed": 5,
+    "total": 5,
+    "phase": "Done"
+  },
+  {
+    "elapsed": 43,
+    "completed": 5,
+    "total": 5,
+    "phase": "Done"
+  }
+]

@@ -1,0 +1,314 @@
+[
+  {
+    "elapsed": 0,
+    "completed": 33,
+    "total": 5000,
+    "phase": "Cycle 1: IDLE (1 req/s, 120s)"
+  },
+  {
+    "elapsed": 13,
+    "completed": 46,
+    "total": 5000,
+    "phase": "Cycle 1: IDLE (1 req/s, 120s)"
+  },
+  {
+    "elapsed": 26,
+    "completed": 54,
+    "total": 5000,
+    "phase": "Cycle 1: IDLE (1 req/s, 120s)"
+  },
+  {
+    "elapsed": 39,
+    "completed": 72,
+    "total": 5000,
+    "phase": "Cycle 1: IDLE (1 req/s, 120s)"
+  },
+  {
+    "elapsed": 52,
+    "completed": 78,
+    "total": 5000,
+    "phase": "Cycle 1: IDLE (1 req/s, 120s)"
+  },
+  {
+    "elapsed": 65,
+    "completed": 92,
+    "total": 5000,
+    "phase": "Cycle 1: IDLE (1 req/s, 120s)"
+  },
+  {
+    "elapsed": 79,
+    "completed": 109,
+    "total": 5000,
+    "phase": "Cycle 1: IDLE (1 req/s, 120s)"
+  },
+  {
+    "elapsed": 92,
+    "completed": 122,
+    "total": 5000,
+    "phase": "Cycle 1: IDLE (1 req/s, 120s)"
+  },
+  {
+    "elapsed": 105,
+    "completed": 135,
+    "total": 5000,
+    "phase": "Cycle 1: IDLE (1 req/s, 120s)"
+  },
+  {
+    "elapsed": 118,
+    "completed": 151,
+    "total": 5000,
+    "phase": "Cycle 1: BURST (15 req/s, 300s)"
+  },
+  {
+    "elapsed": 134,
+    "completed": 158,
+    "total": 5000,
+    "phase": "Cycle 1: BURST (15 req/s, 300s)"
+  },
+  {
+    "elapsed": 148,
+    "completed": 160,
+    "total": 5000,
+    "phase": "Cycle 1: BURST (15 req/s, 300s)"
+  },
+  {
+    "elapsed": 163,
+    "completed": 160,
+    "total": 5000,
+    "phase": "Cycle 1: BURST (15 req/s, 300s)"
+  },
+  {
+    "elapsed": 177,
+    "completed": 161,
+    "total": 5000,
+    "phase": "Cycle 1: BURST (15 req/s, 300s)"
+  },
+  {
+    "elapsed": 192,
+    "completed": 163,
+    "total": 5000,
+    "phase": "Cycle 1: BURST (15 req/s, 300s)"
+  },
+  {
+    "elapsed": 206,
+    "completed": 164,
+    "total": 5000,
+    "phase": "Cycle 1: BURST (15 req/s, 300s)"
+  },
+  {
+    "elapsed": 221,
+    "completed": 164,
+    "total": 5000,
+    "phase": "Cycle 1: BURST (15 req/s, 300s)"
+  },
+  {
+    "elapsed": 235,
+    "completed": 165,
+    "total": 5000,
+    "phase": "Cycle 1: BURST (15 req/s, 300s)"
+  },
+  {
+    "elapsed": 249,
+    "completed": 167,
+    "total": 10000,
+    "phase": "Cycle 1: BURST (15 req/s, 300s)"
+  },
+  {
+    "elapsed": 264,
+    "completed": 168,
+    "total": 10000,
+    "phase": "Cycle 1: BURST (15 req/s, 300s)"
+  },
+  {
+    "elapsed": 278,
+    "completed": 168,
+    "total": 10000,
+    "phase": "Cycle 1: BURST (15 req/s, 300s)"
+  },
+  {
+    "elapsed": 293,
+    "completed": 168,
+    "total": 10000,
+    "phase": "Cycle 1: BURST (15 req/s, 300s)"
+  },
+  {
+    "elapsed": 307,
+    "completed": 168,
+    "total": 10000,
+    "phase": "Cycle 1: BURST (15 req/s, 300s)"
+  },
+  {
+    "elapsed": 322,
+    "completed": 169,
+    "total": 10000,
+    "phase": "Cycle 1: BURST (15 req/s, 300s)"
+  },
+  {
+    "elapsed": 336,
+    "completed": 170,
+    "total": 10000,
+    "phase": "Cycle 1: BURST (15 req/s, 300s)"
+  },
+  {
+    "elapsed": 350,
+    "completed": 171,
+    "total": 10000,
+    "phase": "Cycle 1: BURST (15 req/s, 300s)"
+  },
+  {
+    "elapsed": 365,
+    "completed": 174,
+    "total": 10000,
+    "phase": "Cycle 1: BURST (15 req/s, 300s)"
+  },
+  {
+    "elapsed": 379,
+    "completed": 176,
+    "total": 10000,
+    "phase": "Cycle 1: BURST (15 req/s, 300s)"
+  },
+  {
+    "elapsed": 394,
+    "completed": 176,
+    "total": 10000,
+    "phase": "Cycle 1: BURST (15 req/s, 300s)"
+  },
+  {
+    "elapsed": 408,
+    "completed": 177,
+    "total": 10000,
+    "phase": "Cycle 1: BURST (15 req/s, 300s)"
+  },
+  {
+    "elapsed": 422,
+    "completed": 180,
+    "total": 10000,
+    "phase": "Done"
+  },
+  {
+    "elapsed": 437,
+    "completed": 194,
+    "total": 10000,
+    "phase": "Done"
+  },
+  {
+    "elapsed": 451,
+    "completed": 208,
+    "total": 10000,
+    "phase": "Done"
+  },
+  {
+    "elapsed": 466,
+    "completed": 232,
+    "total": 10000,
+    "phase": "Done"
+  },
+  {
+    "elapsed": 480,
+    "completed": 242,
+    "total": 10000,
+    "phase": "Done"
+  },
+  {
+    "elapsed": 495,
+    "completed": 261,
+    "total": 10000,
+    "phase": "Done"
+  },
+  {
+    "elapsed": 509,
+    "completed": 270,
+    "total": 10000,
+    "phase": "Done"
+  },
+  {
+    "elapsed": 523,
+    "completed": 287,
+    "total": 10000,
+    "phase": "Done"
+  },
+  {
+    "elapsed": 537,
+    "completed": 304,
+    "total": 10000,
+    "phase": "Done"
+  },
+  {
+    "elapsed": 552,
+    "completed": 322,
+    "total": 10000,
+    "phase": "Done"
+  },
+  {
+    "elapsed": 566,
+    "completed": 341,
+    "total": 10000,
+    "phase": "Done"
+  },
+  {
+    "elapsed": 581,
+    "completed": 358,
+    "total": 10000,
+    "phase": "Done"
+  },
+  {
+    "elapsed": 595,
+    "completed": 379,
+    "total": 10000,
+    "phase": "Done"
+  },
+  {
+    "elapsed": 609,
+    "completed": 389,
+    "total": 10000,
+    "phase": "Done"
+  },
+  {
+    "elapsed": 623,
+    "completed": 403,
+    "total": 10000,
+    "phase": "Done"
+  },
+  {
+    "elapsed": 638,
+    "completed": 413,
+    "total": 10000,
+    "phase": "Done"
+  },
+  {
+    "elapsed": 652,
+    "completed": 431,
+    "total": 10000,
+    "phase": "Done"
+  },
+  {
+    "elapsed": 667,
+    "completed": 444,
+    "total": 10000,
+    "phase": "Done"
+  },
+  {
+    "elapsed": 681,
+    "completed": 457,
+    "total": 10000,
+    "phase": "Done"
+  },
+  {
+    "elapsed": 695,
+    "completed": 477,
+    "total": 10000,
+    "phase": "Done"
+  },
+  {
+    "elapsed": 709,
+    "completed": 488,
+    "total": 10000,
+    "phase": "Done"
+  },
+  {
+    "elapsed": 723,
+    "completed": 499,
+    "total": 10000,
+    "phase": "Done"
+  }
+]
