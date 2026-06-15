@@ -1,0 +1,319 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Batch vs Live Traffic Isolation — Qwen3-8B Concurrent Benchmark</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; margin: 40px; max-width: 1400px; background: #fafafa; color: #333; }
+        h1 { color: #1a1a1a; border-bottom: 2px solid #e5e5e5; padding-bottom: 12px; }
+        h2 { color: #444; margin-top: 40px; }
+        .card { background: white; border-radius: 8px; padding: 24px; margin: 20px 0; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+        .chart-container { background: white; border-radius: 8px; padding: 20px; margin: 20px 0; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+        canvas { max-height: 450px; }
+        table { border-collapse: collapse; width: 100%; margin: 20px 0; background: white; border-radius: 8px; overflow: hidden; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+        th, td { padding: 10px 16px; text-align: right; border-bottom: 1px solid #eee; }
+        th { background: #f5f5f5; font-weight: 600; text-align: left; }
+        td:first-child { text-align: left; font-weight: 500; }
+        .good { color: #16a34a; font-weight: 600; }
+        .bad { color: #dc2626; font-weight: 600; }
+        .neutral { color: #6b7280; }
+        .metric-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin: 16px 0; }
+        .metric-grid-4 { display: grid; grid-template-columns: 1fr 1fr 1fr 1fr; gap: 12px; margin: 16px 0; }
+        .metric-box { background: #f9fafb; border-radius: 6px; padding: 16px; border: 1px solid #e5e7eb; }
+        .metric-box h4 { margin: 0 0 4px 0; font-size: 13px; color: #6b7280; text-transform: uppercase; letter-spacing: 0.5px; }
+        .metric-box .value { font-size: 24px; font-weight: 700; }
+        .metric-box .detail { font-size: 13px; color: #6b7280; margin-top: 4px; }
+        code { background: #f3f4f6; padding: 2px 6px; border-radius: 4px; font-size: 14px; }
+        .workload-table { width: auto; margin: 12px 0; }
+        .workload-table td { padding: 4px 16px 4px 0; border: none; text-align: left; }
+        .workload-table td:first-child { font-weight: 600; color: #6b7280; }
+        .legend { display: flex; gap: 20px; margin: 12px 0; font-size: 14px; }
+        .legend-item { display: flex; align-items: center; gap: 6px; }
+        .legend-dot { width: 12px; height: 12px; border-radius: 50%; }
+    </style>
+</head>
+<body>
+    <h1>Batch vs Live Traffic Isolation</h1>
+
+    <div class="card">
+        <h2 style="margin-top:0">Setup</h2>
+        <table class="workload-table">
+            <tr><td>Model</td><td><code>Qwen/Qwen3-8B</code> on 1&times; NVIDIA A100-80GB (max concurrency ~198 @ 4096 tokens)</td></tr>
+            <tr><td>Live traffic</td><td>guidellm <code>--profile concurrent</code> at [5, 30, 50, 80] concurrent requests, 120s per phase, 60s idle between</td></tr>
+            <tr><td>Batch load</td><td>5&times;100 requests submitted at start + 5&times;100 overlapping during first burst (~1500 tok/req, faker prompts)</td></tr>
+            <tr><td>EPP</td><td>Flow control enabled (<code>maxRequests: 50</code>), <code>optimized-baseline</code> profile</td></tr>
+            <tr><td>Gate</td><td>prometheus-budget, <code>max_concurrency=50</code>, fallback=0.0</td></tr>
+        </table>
+
+        <h3>Scenarios</h3>
+        <div class="metric-grid-4">
+            <div class="metric-box">
+                <h4 style="color:#6b7280">Baseline</h4>
+                <div class="detail">No batch stack installed. Pure live traffic only.</div>
+            </div>
+            <div class="metric-box">
+                <h4 style="color:#2563eb">Sync (default)</h4>
+                <div class="detail">Batch processor: <code>per_endpoint=10</code>, AIMD enabled. Out-of-box settings.</div>
+            </div>
+            <div class="metric-box">
+                <h4 style="color:#dc2626">Sync (aggressive)</h4>
+                <div class="detail">Batch processor: <code>per_endpoint=100</code>, AIMD disabled. Worst-case batch flooding.</div>
+            </div>
+            <div class="metric-box">
+                <h4 style="color:#16a34a">Gated (async)</h4>
+                <div class="detail">Async dispatch with prometheus-budget gate. Batch held back when GPU busy.</div>
+            </div>
+        </div>
+    </div>
+
+    <h2>TTFT Across Concurrency Levels</h2>
+    <p>Time to First Token (TTFT) median during burst phases. Lower is better. The gap between baseline
+    and each scenario shows how much batch degrades live traffic.</p>
+    <div class="chart-container">
+        <canvas id="ttftChart"></canvas>
+    </div>
+
+    <h2>ITL Across Concurrency Levels</h2>
+    <p>Inter-Token Latency (ITL) median during burst phases. Higher ITL means slower streaming.</p>
+    <div class="chart-container">
+        <canvas id="itlChart"></canvas>
+    </div>
+
+    <h2>Successful Requests</h2>
+    <p>Number of live requests that completed within the 120s burst window. Lower count means the GPU
+    was too busy with batch to serve live traffic.</p>
+    <div class="chart-container">
+        <canvas id="okChart"></canvas>
+    </div>
+
+    <h2>Batch Completion Timeline</h2>
+    <p>How batch requests progress over time. Shaded bands show burst (red) and idle (green) phases.
+    With the gate, batch should pause during bursts and resume during idle.</p>
+    <div class="chart-container">
+        <canvas id="timelineChart"></canvas>
+    </div>
+
+    <h2>Detailed Metrics</h2>
+    <table>
+        <tr>
+            <th>Concurrency</th>
+            <th>Scenario</th>
+            <th>Successful</th>
+            <th>Incomplete</th>
+            <th>Errored</th>
+            <th>TTFT med (ms)</th>
+            <th>TTFT p95 (ms)</th>
+            <th>TTFT p99 (ms)</th>
+            <th>ITL med (ms)</th>
+            <th>Latency med (s)</th>
+        </tr>
+        <tbody id="detailTable"></tbody>
+    </table>
+
+    <div class="card" style="margin-top: 40px">
+        <h2 style="margin-top:0">Analysis</h2>
+        <p>With <strong>Qwen3-8B on A100-80GB</strong> (max concurrency ~198), the GPU has substantial
+        headroom at all tested concurrency levels (5–80). Even at 80 concurrent live requests, the GPU
+        is only at ~40% capacity.</p>
+
+        <p><strong>Sync-default</strong> (per_endpoint=10, AIMD on): batch processor is limited to 10
+        concurrent inference requests. With AIMD further reducing on backpressure, batch adds negligible
+        load. TTFT is indistinguishable from baseline.</p>
+
+        <p><strong>Sync-aggressive</strong> (per_endpoint=100, AIMD off): batch floods the GPU with up
+        to 100 concurrent requests. At low concurrency (5), this doubles ITL (12ms vs 6ms) because batch
+        consumes half the GPU. But batch completes quickly (all 1000 requests done before phase 3), so
+        higher concurrency phases see no impact.</p>
+
+        <p><strong>Gated</strong>: the prometheus-budget gate monitors <code>vllm:num_requests_running</code>
+        and holds batch back when utilization exceeds the threshold. With this model, the gate is partially
+        effective — it slows batch during bursts but doesn't fully close because the GPU has abundant headroom.</p>
+
+        <p><strong>Key takeaway</strong>: for this model/GPU combination, the gate's value is limited because
+        the GPU never truly saturates. A larger model (tighter GPU headroom) or a constrained GPU (fewer KV cache
+        blocks) would show more dramatic batch interference in sync mode and correspondingly more gate value.</p>
+    </div>
+
+<script>
+const DATA = {"burst": {"baseline": {"5": {"Successful": "199", "Incomplete": "4", "Errored": "0", "Total": "203", "lat": "2.8847286701202393", "ttft_mean": "58.94858753261855", "ttft_med": "55.17864227294922", "ttft_pct": "[29.14261817932129, 29.14261817932129, 30.611276626586914, 39.62302207946777, 42.372703552246094, 48.979759216308594, 60.37592887878418, 69.4572925567627, 92.38815307617188, 210.74271202087402, 211.64846420288086]", "itl": "5.867775156644631", "ttft_p50": 48.979759216308594, "ttft_p95": 92.38815307617188, "ttft_p99": 210.74271202087402}, "30": {"Successful": "806", "Incomplete": "29", "Errored": "0", "Total": "835", "lat": "4.3335862159729", "ttft_mean": "58.58829388251671", "ttft_med": "56.34760856628418", "ttft_pct": "[26.479721069335938, 26.479721069335938, 27.464866638183594, 28.244733810424805, 28.64813804626465, 44.30127143859863, 68.95780563354492, 87.4021053314209, 101.41801834106445, 133.5301399230957, 160.72678565979004]", "itl": "8.666104142383862", "ttft_p50": 44.30127143859863, "ttft_p95": 101.41801834106445, "ttft_p99": 133.5301399230957}, "50": {"Successful": "975", "Incomplete": "50", "Errored": "0", "Total": "1025", "lat": "5.968511343002319", "ttft_mean": "123.61407451140573", "ttft_med": "68.66240501403809", "ttft_pct": "[38.054704666137695, 38.054704666137695, 44.9366569519043, 50.768375396728516, 54.24809455871582, 60.25242805480957, 88.6378288269043, 115.19265174865723, 199.1441249847412, 1714.5650386810303, 1732.5868606567383]", "itl": "11.4381366453463", "ttft_p50": 60.25242805480957, "ttft_p95": 199.1441249847412, "ttft_p99": 1714.5650386810303}, "80": {"Successful": "1138", "Incomplete": "80", "Errored": "0", "Total": "1218", "lat": "8.137909412384033", "ttft_mean": "197.36956272058202", "ttft_med": "85.6783390045166", "ttft_pct": "[47.14035987854004, 49.06868934631348, 56.32662773132324, 61.78760528564453, 65.25349617004395, 72.51501083374023, 116.43743515014648, 168.49064826965332, 1055.7324886322021, 2720.9534645080566, 2791.685104370117]", "itl": "15.538408976643025", "ttft_p50": 72.51501083374023, "ttft_p95": 1055.7324886322021, "ttft_p99": 2720.9534645080566}}, "sync_default": {"5": {"Successful": "176", "Incomplete": "4", "Errored": "0", "Total": "180", "lat": "3.2200658321380615", "ttft_mean": "43.02350228483027", "ttft_med": "42.93560981750488", "ttft_pct": "[23.920536041259766, 23.920536041259766, 24.06024932861328, 24.695158004760742, 25.31886100769043, 26.9622802734375, 56.710243225097656, 63.90213966369629, 70.12200355529785, 77.4998664855957, 80.0168514251709]", "itl": "6.602124093284069", "ttft_p50": 26.9622802734375, "ttft_p95": 70.12200355529785, "ttft_p99": 77.4998664855957}, "30": {"Successful": "725", "Incomplete": "30", "Errored": "0", "Total": "755", "lat": "4.778570890426636", "ttft_mean": "61.45482063293457", "ttft_med": "59.34429168701172", "ttft_pct": "[28.397083282470703, 28.397083282470703, 30.318498611450195, 31.319618225097656, 32.12332725524902, 48.68936538696289, 68.96305084228516, 94.17080879211426, 116.78361892700195, 123.82841110229492, 141.73460006713867]", "itl": "9.563150456701248", "ttft_p50": 48.68936538696289, "ttft_p95": 116.78361892700195, "ttft_p99": 123.82841110229492}, "50": {"Successful": "937", "Incomplete": "49", "Errored": "0", "Total": "986", "lat": "6.22604775428772", "ttft_mean": "79.5540517015162", "ttft_med": "70.28865814208984", "ttft_pct": "[33.440351486206055, 33.440351486206055, 35.271644592285156, 47.19805717468262, 54.3062686920166, 61.55991554260254, 91.4301872253418, 119.0028190612793, 143.14627647399902, 157.301664352417, 174.37505722045898]", "itl": "12.201700381890028", "ttft_p50": 61.55991554260254, "ttft_p95": 143.14627647399902, "ttft_p99": 157.301664352417}, "80": {"Successful": "1082", "Incomplete": "80", "Errored": "0", "Total": "1162", "lat": "8.483055114746094", "ttft_mean": "101.57340776016883", "ttft_med": "89.22457695007324", "ttft_pct": "[40.97294807434082, 42.630910873413086, 51.458120346069336, 64.18132781982422, 68.47596168518066, 77.10409164428711, 116.00017547607422, 144.95253562927246, 203.27496528625488, 256.3779354095459, 285.51173210144043]", "itl": "16.5908607419508", "ttft_p50": 77.10409164428711, "ttft_p95": 203.27496528625488, "ttft_p99": 256.3779354095459}}, "sync_aggressive": {"5": {"Successful": "105", "Incomplete": "4", "Errored": "0", "Total": "109", "lat": "5.341728687286377", "ttft_mean": "60.349216915312276", "ttft_med": "58.957815170288086", "ttft_pct": "[21.812915802001953, 21.812915802001953, 22.931575775146484, 26.749610900878906, 27.16350555419922, 41.4581298828125, 76.00116729736328, 90.23761749267578, 93.87445449829102, 111.80496215820312, 164.53814506530762]", "itl": "12.134036067214426", "ttft_p50": 41.4581298828125, "ttft_p95": 93.87445449829102, "ttft_p99": 111.80496215820312}, "30": {"Successful": "786", "Incomplete": "29", "Errored": "0", "Total": "815", "lat": "4.479983806610107", "ttft_mean": "63.471949434159065", "ttft_med": "60.38689613342285", "ttft_pct": "[25.687217712402344, 25.687217712402344, 27.752161026000977, 28.839826583862305, 36.96608543395996, 50.78911781311035, 73.38666915893555, 92.13685989379883, 105.44133186340332, 122.41792678833008, 135.25772094726562]", "itl": "8.757525936086127", "ttft_p50": 50.78911781311035, "ttft_p95": 105.44133186340332, "ttft_p99": 122.41792678833008}, "50": {"Successful": "998", "Incomplete": "50", "Errored": "0", "Total": "1048", "lat": "5.835689306259155", "ttft_mean": "74.6072155679156", "ttft_med": "67.47031211853027", "ttft_pct": "[31.31842613220215, 31.31842613220215, 32.78803825378418, 43.10178756713867, 50.531864166259766, 58.38179588317871, 84.3973159790039, 108.63971710205078, 139.70613479614258, 171.97132110595703, 185.34445762634277]", "itl": "11.402270903712825", "ttft_p50": 58.38179588317871, "ttft_p95": 139.70613479614258, "ttft_p99": 171.97132110595703}, "80": {"Successful": "1172", "Incomplete": "79", "Errored": "0", "Total": "1251", "lat": "7.844114542007446", "ttft_mean": "96.78904493514182", "ttft_med": "82.93747901916504", "ttft_pct": "[36.35430335998535, 39.234161376953125, 41.14675521850586, 58.611154556274414, 63.149452209472656, 70.86801528930664, 113.5108470916748, 144.68121528625488, 175.0328540802002, 231.62484169006348, 235.6851100921631]", "itl": "15.46511637039289", "ttft_p50": 70.86801528930664, "ttft_p95": 175.0328540802002, "ttft_p99": 231.62484169006348}}, "gated": {"5": {"Successful": "184", "Incomplete": "4", "Errored": "0", "Total": "188", "lat": "3.1020138263702393", "ttft_mean": "43.20692627326302", "ttft_med": "39.51001167297363", "ttft_pct": "[21.586179733276367, 21.586179733276367, 23.018360137939453, 23.770570755004883, 24.213552474975586, 29.047012329101562, 58.52222442626953, 65.83476066589355, 70.43981552124023, 100.03352165222168, 100.14748573303223]", "itl": "6.336798879611316", "ttft_p50": 29.047012329101562, "ttft_p95": 70.43981552124023, "ttft_p99": 100.03352165222168}, "30": {"Successful": "743", "Incomplete": "30", "Errored": "0", "Total": "773", "lat": "4.641191482543945", "ttft_mean": "60.21727463117679", "ttft_med": "59.01455879211426", "ttft_pct": "[26.147127151489258, 26.147127151489258, 29.169082641601562, 30.023574829101562, 30.45034408569336, 46.56696319580078, 68.95017623901367, 89.2949104309082, 105.45587539672852, 134.86909866333008, 138.43703269958496]", "itl": "9.374522943101171", "ttft_p50": 46.56696319580078, "ttft_p95": 105.45587539672852, "ttft_p99": 134.86909866333008}, "50": {"Successful": "970", "Incomplete": "49", "Errored": "0", "Total": "1019", "lat": "6.038266897201538", "ttft_mean": "78.07511988374375", "ttft_med": "69.99444961547852", "ttft_pct": "[33.770084381103516, 33.770084381103516, 35.08329391479492, 44.4791316986084, 51.86891555786133, 60.39261817932129, 89.62130546569824, 113.91258239746094, 134.50360298156738, 173.93851280212402, 192.73900985717773]", "itl": "11.691091518209438", "ttft_p50": 60.39261817932129, "ttft_p95": 134.50360298156738, "ttft_p99": 173.93851280212402}, "80": {"Successful": "1118", "Incomplete": "80", "Errored": "0", "Total": "1198", "lat": "8.186427116394043", "ttft_mean": "99.99166746258949", "ttft_med": "86.75169944763184", "ttft_pct": "[39.75200653076172, 40.05146026611328, 47.09792137145996, 62.70170211791992, 66.6818618774414, 74.1875171661377, 114.95113372802734, 142.11249351501465, 178.47728729248047, 248.36230278015137, 257.43937492370605]", "itl": "16.096182644660836", "ttft_p50": 74.1875171661377, "ttft_p95": 178.47728729248047, "ttft_p99": 248.36230278015137}}}, "idle": {"sync_default": {"1": {"Successful": "84", "Incomplete": "4", "Errored": "0", "Total": "88", "lat": "3.4223599433898926", "ttft_mean": "64.91879905973161", "ttft_med": "56.444644927978516", "ttft_pct": "[37.314653396606445, 37.314653396606445, 37.314653396606445, 40.650129318237305, 44.18492317199707, 48.943281173706055, 63.220977783203125, 75.29592514038086, 202.67248153686523, 203.66573333740234, 203.66573333740234]", "itl": "6.665641611272639", "ttft_p50": 48.943281173706055, "ttft_p95": 202.67248153686523, "ttft_p99": 203.66573333740234}, "2": {"Successful": "89", "Incomplete": "4", "Errored": "0", "Total": "93", "lat": "3.2870638370513916", "ttft_mean": "28.099807460656326", "ttft_med": "25.788545608520508", "ttft_pct": "[23.6356258392334, 23.6356258392334, 23.6356258392334, 24.52254295349121, 24.60765838623047, 25.18630027770996, 31.411409378051758, 32.81354904174805, 34.40570831298828, 44.91877555847168, 44.91877555847168]", "itl": "6.401458933271516", "ttft_p50": 25.18630027770996, "ttft_p95": 34.40570831298828, "ttft_p99": 44.91877555847168}, "3": {"Successful": "85", "Incomplete": "5", "Errored": "0", "Total": "90", "lat": "3.6038358211517334", "ttft_mean": "64.72596000222597", "ttft_med": "56.79488182067871", "ttft_pct": "[32.88459777832031, 32.88459777832031, 32.88459777832031, 42.545318603515625, 44.60549354553223, 48.8736629486084, 62.89267539978027, 77.34489440917969, 202.77976989746094, 204.20503616333008, 204.20503616333008]", "itl": "6.691685949380581", "ttft_p50": 48.8736629486084, "ttft_p95": 202.77976989746094, "ttft_p99": 204.20503616333008}, "4": {"Successful": "85", "Incomplete": "4", "Errored": "0", "Total": "89", "lat": "3.4425456523895264", "ttft_mean": "64.4936393289005", "ttft_med": "55.123329162597656", "ttft_pct": "[32.28020668029785, 32.28020668029785, 32.28020668029785, 41.84103012084961, 46.675682067871094, 50.19545555114746, 63.79413604736328, 69.45204734802246, 202.13603973388672, 202.18348503112793, 202.18348503112793]", "itl": "6.629911375923391", "ttft_p50": 50.19545555114746, "ttft_p95": 202.13603973388672, "ttft_p99": 202.18348503112793}}, "sync_aggressive": {"1": {"Successful": "45", "Incomplete": "4", "Errored": "0", "Total": "49", "lat": "5.921959400177002", "ttft_mean": "96.39381832546657", "ttft_med": "82.39293098449707", "ttft_pct": "[47.77169227600098, 47.77169227600098, 47.77169227600098, 58.22134017944336, 60.75334548950195, 70.06597518920898, 91.45975112915039, 244.858980178833, 245.05233764648438, 246.1559772491455, 246.1559772491455]", "itl": "13.57350776893924", "ttft_p50": 70.06597518920898, "ttft_p95": 245.05233764648438, "ttft_p99": 246.1559772491455}, "2": {"Successful": "99", "Incomplete": "4", "Errored": "0", "Total": "103", "lat": "2.9030044078826904", "ttft_mean": "45.61333463649558", "ttft_med": "29.352426528930664", "ttft_pct": "[21.27552032470703, 21.27552032470703, 21.27552032470703, 25.43926239013672, 26.1688232421875, 26.996612548828125, 54.38089370727539, 59.64517593383789, 65.53435325622559, 196.71630859375, 196.71630859375]", "itl": "5.69819744670929", "ttft_p50": 26.996612548828125, "ttft_p95": 65.53435325622559, "ttft_p99": 196.71630859375}, "3": {"Successful": "96", "Incomplete": "4", "Errored": "0", "Total": "100", "lat": "2.9875524044036865", "ttft_mean": "59.52140440543492", "ttft_med": "55.31930923461914", "ttft_pct": "[29.116392135620117, 29.116392135620117, 29.116392135620117, 41.80598258972168, 45.2420711517334, 49.29804801940918, 59.70907211303711, 64.81432914733887, 135.65564155578613, 198.2553005218506, 198.2553005218506]", "itl": "5.864683267816477", "ttft_p50": 49.29804801940918, "ttft_p95": 135.65564155578613, "ttft_p99": 198.2553005218506}, "4": {"Successful": "97", "Incomplete": "4", "Errored": "0", "Total": "101", "lat": "2.9717700481414795", "ttft_mean": "60.48513196178318", "ttft_med": "55.683135986328125", "ttft_pct": "[33.66827964782715, 33.66827964782715, 33.66827964782715, 41.486263275146484, 42.696475982666016, 49.03435707092285, 60.0581169128418, 65.57536125183105, 74.88059997558594, 202.5899887084961, 202.5899887084961]", "itl": "5.862613861588226", "ttft_p50": 49.03435707092285, "ttft_p95": 74.88059997558594, "ttft_p99": 202.5899887084961}}, "gated": {"1": {"Successful": "88", "Incomplete": "4", "Errored": "0", "Total": "92", "lat": "3.355756998062134", "ttft_mean": "62.82224980267612", "ttft_med": "56.17880821228027", "ttft_pct": "[31.77642822265625, 31.77642822265625, 31.77642822265625, 39.484500885009766, 43.13087463378906, 47.954559326171875, 61.55657768249512, 70.38259506225586, 198.95172119140625, 200.1657485961914, 200.1657485961914]", "itl": "6.407274055885915", "ttft_p50": 47.954559326171875, "ttft_p95": 198.95172119140625, "ttft_p99": 200.1657485961914}, "2": {"Successful": "95", "Incomplete": "4", "Errored": "0", "Total": "99", "lat": "3.0989649295806885", "ttft_mean": "28.656916869314095", "ttft_med": "29.3886661529541", "ttft_pct": "[22.831201553344727, 22.831201553344727, 22.831201553344727, 23.59771728515625, 23.919105529785156, 24.590015411376953, 30.562162399291992, 31.539440155029297, 45.75181007385254, 46.52810096740723, 46.52810096740723]", "itl": "6.176565118031959", "ttft_p50": 24.590015411376953, "ttft_p95": 45.75181007385254, "ttft_p99": 46.52810096740723}, "3": {"Successful": "88", "Incomplete": "4", "Errored": "0", "Total": "92", "lat": "3.244591236114502", "ttft_mean": "62.46234612031417", "ttft_med": "57.18827247619629", "ttft_pct": "[31.164169311523438, 31.164169311523438, 31.164169311523438, 40.68279266357422, 44.73996162414551, 50.605058670043945, 63.2781982421875, 70.44696807861328, 78.76348495483398, 196.63000106811523, 196.63000106811523]", "itl": "6.418764511638076", "ttft_p50": 50.605058670043945, "ttft_p95": 78.76348495483398, "ttft_p99": 196.63000106811523}, "4": {"Successful": "89", "Incomplete": "4", "Errored": "0", "Total": "93", "lat": "3.2524003982543945", "ttft_mean": "63.12738107831291", "ttft_med": "55.573463439941406", "ttft_pct": "[30.79509735107422, 30.79509735107422, 30.79509735107422, 40.15040397644043, 42.473793029785156, 48.60639572143555, 62.1337890625, 75.408935546875, 198.37212562561035, 199.42069053649902, 199.42069053649902]", "itl": "6.406894744051311", "ttft_p50": 48.60639572143555, "ttft_p95": 198.37212562561035, "ttft_p99": 199.42069053649902}}}, "timelines": {"sync-default": [{"elapsed": 0, "completed": 43, "total": 500, "phase": "Phase 1: IDLE (5 concurrent, 60s)"}, {"elapsed": 19, "completed": 61, "total": 500, "phase": "Phase 1: IDLE (5 concurrent, 60s)"}, {"elapsed": 38, "completed": 86, "total": 500, "phase": "Phase 1: IDLE (5 concurrent, 60s)"}, {"elapsed": 57, "completed": 106, "total": 500, "phase": "Phase 1: BURST (5 concurrent, 120s)"}, {"elapsed": 93, "completed": 147, "total": 1000, "phase": "Phase 1: BURST (5 concurrent, 120s)"}, {"elapsed": 119, "completed": 177, "total": 1000, "phase": "Phase 1: BURST (5 concurrent, 120s)"}, {"elapsed": 146, "completed": 198, "total": 1000, "phase": "Phase 1: BURST (5 concurrent, 120s)"}, {"elapsed": 172, "completed": 229, "total": 1000, "phase": "Phase 2: IDLE (5 concurrent, 60s)"}, {"elapsed": 198, "completed": 257, "total": 1000, "phase": "Phase 2: IDLE (5 concurrent, 60s)"}, {"elapsed": 225, "completed": 291, "total": 1000, "phase": "Phase 2: IDLE (5 concurrent, 60s)"}, {"elapsed": 251, "completed": 324, "total": 1000, "phase": "Phase 2: BURST (30 concurrent, 120s)"}, {"elapsed": 277, "completed": 349, "total": 1000, "phase": "Phase 2: BURST (30 concurrent, 120s)"}, {"elapsed": 303, "completed": 365, "total": 1000, "phase": "Phase 2: BURST (30 concurrent, 120s)"}, {"elapsed": 329, "completed": 383, "total": 1000, "phase": "Phase 2: BURST (30 concurrent, 120s)"}, {"elapsed": 355, "completed": 404, "total": 1000, "phase": "Phase 2: BURST (30 concurrent, 120s)"}, {"elapsed": 381, "completed": 427, "total": 1000, "phase": "Phase 3: IDLE (5 concurrent, 60s)"}, {"elapsed": 408, "completed": 460, "total": 1000, "phase": "Phase 3: IDLE (5 concurrent, 60s)"}, {"elapsed": 434, "completed": 486, "total": 1000, "phase": "Phase 3: BURST (50 concurrent, 120s)"}, {"elapsed": 459, "completed": 512, "total": 1000, "phase": "Phase 3: BURST (50 concurrent, 120s)"}, {"elapsed": 485, "completed": 529, "total": 1000, "phase": "Phase 3: BURST (50 concurrent, 120s)"}, {"elapsed": 512, "completed": 547, "total": 1000, "phase": "Phase 3: BURST (50 concurrent, 120s)"}, {"elapsed": 538, "completed": 563, "total": 1000, "phase": "Phase 3: BURST (50 concurrent, 120s)"}, {"elapsed": 564, "completed": 579, "total": 1000, "phase": "Phase 4: IDLE (5 concurrent, 60s)"}, {"elapsed": 590, "completed": 612, "total": 1000, "phase": "Phase 4: IDLE (5 concurrent, 60s)"}, {"elapsed": 615, "completed": 644, "total": 1000, "phase": "Phase 4: IDLE (5 concurrent, 60s)"}, {"elapsed": 641, "completed": 667, "total": 1000, "phase": "Phase 4: BURST (80 concurrent, 120s)"}, {"elapsed": 666, "completed": 685, "total": 1000, "phase": "Phase 4: BURST (80 concurrent, 120s)"}, {"elapsed": 691, "completed": 690, "total": 1000, "phase": "Phase 4: BURST (80 concurrent, 120s)"}, {"elapsed": 717, "completed": 699, "total": 1000, "phase": "Phase 4: BURST (80 concurrent, 120s)"}, {"elapsed": 742, "completed": 706, "total": 1000, "phase": "Phase 4: BURST (80 concurrent, 120s)"}, {"elapsed": 767, "completed": 720, "total": 1000, "phase": "Done"}, {"elapsed": 792, "completed": 754, "total": 1000, "phase": "Done"}, {"elapsed": 818, "completed": 787, "total": 1000, "phase": "Done"}, {"elapsed": 843, "completed": 812, "total": 1000, "phase": "Done"}, {"elapsed": 868, "completed": 846, "total": 1000, "phase": "Done"}, {"elapsed": 894, "completed": 873, "total": 1000, "phase": "Done"}, {"elapsed": 919, "completed": 898, "total": 1000, "phase": "Done"}, {"elapsed": 944, "completed": 934, "total": 1000, "phase": "Done"}, {"elapsed": 969, "completed": 960, "total": 1000, "phase": "Done"}, {"elapsed": 995, "completed": 991, "total": 1000, "phase": "Done"}, {"elapsed": 1020, "completed": 1000, "total": 1000, "phase": "Done"}], "sync-aggressive": [{"elapsed": 0, "completed": 201, "total": 500, "phase": "Phase 1: IDLE (5 concurrent, 60s)"}, {"elapsed": 18, "completed": 303, "total": 500, "phase": "Phase 1: IDLE (5 concurrent, 60s)"}, {"elapsed": 37, "completed": 396, "total": 500, "phase": "Phase 1: IDLE (5 concurrent, 60s)"}, {"elapsed": 55, "completed": 477, "total": 500, "phase": "Phase 1: BURST (5 concurrent, 120s)"}, {"elapsed": 89, "completed": 627, "total": 1000, "phase": "Phase 1: BURST (5 concurrent, 120s)"}, {"elapsed": 114, "completed": 751, "total": 1000, "phase": "Phase 1: BURST (5 concurrent, 120s)"}, {"elapsed": 139, "completed": 885, "total": 1000, "phase": "Phase 1: BURST (5 concurrent, 120s)"}, {"elapsed": 164, "completed": 968, "total": 1000, "phase": "Phase 1: BURST (5 concurrent, 120s)"}, {"elapsed": 189, "completed": 1000, "total": 1000, "phase": "Phase 2: IDLE (5 concurrent, 60s)"}, {"elapsed": 214, "completed": 1000, "total": 1000, "phase": "Phase 2: IDLE (5 concurrent, 60s)"}, {"elapsed": 239, "completed": 1000, "total": 1000, "phase": "Phase 2: IDLE (5 concurrent, 60s)"}, {"elapsed": 264, "completed": 1000, "total": 1000, "phase": "Phase 2: BURST (30 concurrent, 120s)"}, {"elapsed": 289, "completed": 1000, "total": 1000, "phase": "Phase 2: BURST (30 concurrent, 120s)"}, {"elapsed": 314, "completed": 1000, "total": 1000, "phase": "Phase 2: BURST (30 concurrent, 120s)"}, {"elapsed": 339, "completed": 1000, "total": 1000, "phase": "Phase 2: BURST (30 concurrent, 120s)"}, {"elapsed": 364, "completed": 1000, "total": 1000, "phase": "Phase 2: BURST (30 concurrent, 120s)"}, {"elapsed": 389, "completed": 1000, "total": 1000, "phase": "Phase 3: IDLE (5 concurrent, 60s)"}, {"elapsed": 414, "completed": 1000, "total": 1000, "phase": "Phase 3: IDLE (5 concurrent, 60s)"}, {"elapsed": 439, "completed": 1000, "total": 1000, "phase": "Phase 3: BURST (50 concurrent, 120s)"}, {"elapsed": 464, "completed": 1000, "total": 1000, "phase": "Phase 3: BURST (50 concurrent, 120s)"}, {"elapsed": 490, "completed": 1000, "total": 1000, "phase": "Phase 3: BURST (50 concurrent, 120s)"}, {"elapsed": 516, "completed": 1000, "total": 1000, "phase": "Phase 3: BURST (50 concurrent, 120s)"}, {"elapsed": 542, "completed": 1000, "total": 1000, "phase": "Phase 3: BURST (50 concurrent, 120s)"}, {"elapsed": 599, "completed": 1000, "total": 1000, "phase": "Phase 4: IDLE (5 concurrent, 60s)"}, {"elapsed": 625, "completed": 1000, "total": 1000, "phase": "Phase 4: IDLE (5 concurrent, 60s)"}, {"elapsed": 651, "completed": 1000, "total": 1000, "phase": "Phase 4: BURST (80 concurrent, 120s)"}, {"elapsed": 676, "completed": 1000, "total": 1000, "phase": "Phase 4: BURST (80 concurrent, 120s)"}, {"elapsed": 701, "completed": 1000, "total": 1000, "phase": "Phase 4: BURST (80 concurrent, 120s)"}, {"elapsed": 726, "completed": 1000, "total": 1000, "phase": "Phase 4: BURST (80 concurrent, 120s)"}, {"elapsed": 752, "completed": 1000, "total": 1000, "phase": "Phase 4: BURST (80 concurrent, 120s)"}, {"elapsed": 777, "completed": 1000, "total": 1000, "phase": "Done"}], "gated": [{"elapsed": 0, "completed": 22, "total": 100, "phase": "Phase 1: IDLE (5 concurrent, 60s)"}, {"elapsed": 19, "completed": 29, "total": 100, "phase": "Phase 1: IDLE (5 concurrent, 60s)"}, {"elapsed": 37, "completed": 38, "total": 100, "phase": "Phase 1: IDLE (5 concurrent, 60s)"}, {"elapsed": 56, "completed": 49, "total": 100, "phase": "Phase 1: BURST (5 concurrent, 120s)"}, {"elapsed": 89, "completed": 62, "total": 100, "phase": "Phase 1: BURST (5 concurrent, 120s)"}, {"elapsed": 114, "completed": 74, "total": 100, "phase": "Phase 1: BURST (5 concurrent, 120s)"}, {"elapsed": 140, "completed": 87, "total": 100, "phase": "Phase 1: BURST (5 concurrent, 120s)"}, {"elapsed": 166, "completed": 99, "total": 200, "phase": "Phase 1: BURST (5 concurrent, 120s)"}, {"elapsed": 192, "completed": 109, "total": 200, "phase": "Phase 2: IDLE (5 concurrent, 60s)"}, {"elapsed": 217, "completed": 120, "total": 200, "phase": "Phase 2: IDLE (5 concurrent, 60s)"}, {"elapsed": 243, "completed": 130, "total": 200, "phase": "Phase 2: BURST (30 concurrent, 120s)"}, {"elapsed": 269, "completed": 138, "total": 200, "phase": "Phase 2: BURST (30 concurrent, 120s)"}, {"elapsed": 295, "completed": 148, "total": 200, "phase": "Phase 2: BURST (30 concurrent, 120s)"}, {"elapsed": 321, "completed": 159, "total": 200, "phase": "Phase 2: BURST (30 concurrent, 120s)"}, {"elapsed": 347, "completed": 167, "total": 200, "phase": "Phase 2: BURST (30 concurrent, 120s)"}, {"elapsed": 373, "completed": 171, "total": 200, "phase": "Phase 3: IDLE (5 concurrent, 60s)"}, {"elapsed": 398, "completed": 183, "total": 200, "phase": "Phase 3: IDLE (5 concurrent, 60s)"}, {"elapsed": 424, "completed": 195, "total": 200, "phase": "Phase 3: IDLE (5 concurrent, 60s)"}, {"elapsed": 450, "completed": 209, "total": 300, "phase": "Phase 3: BURST (50 concurrent, 120s)"}, {"elapsed": 475, "completed": 213, "total": 300, "phase": "Phase 3: BURST (50 concurrent, 120s)"}, {"elapsed": 501, "completed": 216, "total": 300, "phase": "Phase 3: BURST (50 concurrent, 120s)"}, {"elapsed": 526, "completed": 219, "total": 300, "phase": "Phase 3: BURST (50 concurrent, 120s)"}, {"elapsed": 552, "completed": 219, "total": 300, "phase": "Phase 3: BURST (50 concurrent, 120s)"}, {"elapsed": 578, "completed": 219, "total": 300, "phase": "Phase 4: IDLE (5 concurrent, 60s)"}, {"elapsed": 604, "completed": 230, "total": 300, "phase": "Phase 4: IDLE (5 concurrent, 60s)"}, {"elapsed": 629, "completed": 240, "total": 300, "phase": "Phase 4: IDLE (5 concurrent, 60s)"}, {"elapsed": 654, "completed": 249, "total": 300, "phase": "Phase 4: BURST (80 concurrent, 120s)"}, {"elapsed": 680, "completed": 252, "total": 300, "phase": "Phase 4: BURST (80 concurrent, 120s)"}, {"elapsed": 706, "completed": 256, "total": 300, "phase": "Phase 4: BURST (80 concurrent, 120s)"}, {"elapsed": 731, "completed": 259, "total": 300, "phase": "Phase 4: BURST (80 concurrent, 120s)"}, {"elapsed": 757, "completed": 263, "total": 300, "phase": "Phase 4: BURST (80 concurrent, 120s)"}, {"elapsed": 783, "completed": 263, "total": 300, "phase": "Done"}, {"elapsed": 809, "completed": 277, "total": 300, "phase": "Done"}, {"elapsed": 834, "completed": 287, "total": 300, "phase": "Done"}, {"elapsed": 860, "completed": 304, "total": 400, "phase": "Done"}, {"elapsed": 885, "completed": 311, "total": 400, "phase": "Done"}, {"elapsed": 911, "completed": 322, "total": 400, "phase": "Done"}, {"elapsed": 936, "completed": 337, "total": 400, "phase": "Done"}, {"elapsed": 963, "completed": 353, "total": 400, "phase": "Done"}, {"elapsed": 989, "completed": 364, "total": 400, "phase": "Done"}, {"elapsed": 1015, "completed": 377, "total": 400, "phase": "Done"}, {"elapsed": 1041, "completed": 392, "total": 400, "phase": "Done"}]}, "rates": [5, 30, 50, 80]};
+
+const COLORS = {
+    baseline: {border: '#6b7280', bg: 'rgba(107,114,128,0.7)'},
+    sync_default: {border: '#2563eb', bg: 'rgba(37,99,235,0.7)'},
+    sync_aggressive: {border: '#dc2626', bg: 'rgba(220,38,38,0.7)'},
+    gated: {border: '#16a34a', bg: 'rgba(22,163,74,0.7)'},
+};
+
+const LABELS = {
+    baseline: 'Baseline (no batch)',
+    sync_default: 'Sync (default)',
+    sync_aggressive: 'Sync (aggressive)',
+    gated: 'Gated (async)',
+};
+
+const rates = DATA.rates;
+
+function getMetric(scenario, rate, field) {
+    const d = DATA.burst[scenario];
+    if (!d) return 0;
+    const r = d[String(rate)];
+    if (!r) return 0;
+    return parseFloat(r[field]) || 0;
+}
+
+// TTFT Chart
+new Chart(document.getElementById('ttftChart'), {
+    type: 'bar',
+    data: {
+        labels: rates.map(r => r + ' concurrent'),
+        datasets: Object.keys(COLORS).map(sc => ({
+            label: LABELS[sc],
+            data: rates.map(r => getMetric(sc, r, 'ttft_med')),
+            backgroundColor: COLORS[sc].bg,
+            borderColor: COLORS[sc].border,
+            borderWidth: 1,
+        }))
+    },
+    options: {
+        responsive: true,
+        plugins: {title: {display: true, text: 'TTFT Median (ms) — lower is better', font: {size: 16}}},
+        scales: {y: {title: {display: true, text: 'TTFT (ms)'}, beginAtZero: true}}
+    }
+});
+
+// ITL Chart
+new Chart(document.getElementById('itlChart'), {
+    type: 'bar',
+    data: {
+        labels: rates.map(r => r + ' concurrent'),
+        datasets: Object.keys(COLORS).map(sc => ({
+            label: LABELS[sc],
+            data: rates.map(r => getMetric(sc, r, 'itl')),
+            backgroundColor: COLORS[sc].bg,
+            borderColor: COLORS[sc].border,
+            borderWidth: 1,
+        }))
+    },
+    options: {
+        responsive: true,
+        plugins: {title: {display: true, text: 'ITL Median (ms) — lower is better', font: {size: 16}}},
+        scales: {y: {title: {display: true, text: 'ITL (ms)'}, beginAtZero: true}}
+    }
+});
+
+// Successful requests chart
+new Chart(document.getElementById('okChart'), {
+    type: 'bar',
+    data: {
+        labels: rates.map(r => r + ' concurrent'),
+        datasets: Object.keys(COLORS).map(sc => ({
+            label: LABELS[sc],
+            data: rates.map(r => getMetric(sc, r, 'Successful')),
+            backgroundColor: COLORS[sc].bg,
+            borderColor: COLORS[sc].border,
+            borderWidth: 1,
+        }))
+    },
+    options: {
+        responsive: true,
+        plugins: {title: {display: true, text: 'Successful Requests (120s burst) — higher is better', font: {size: 16}}},
+        scales: {y: {title: {display: true, text: 'Requests'}, beginAtZero: true}}
+    }
+});
+
+// Timeline chart
+const timelineScenarios = {
+    'sync-default': {color: '#2563eb', label: 'Sync (default)'},
+    'sync-aggressive': {color: '#dc2626', label: 'Sync (aggressive)'},
+    'gated': {color: '#16a34a', label: 'Gated (async)'},
+};
+
+const timelineDatasets = [];
+for (const [name, cfg] of Object.entries(timelineScenarios)) {
+    const tl = DATA.timelines[name] || [];
+    if (tl.length > 0) {
+        timelineDatasets.push({
+            label: cfg.label,
+            data: tl.map(t => ({x: t.elapsed, y: t.completed})),
+            borderColor: cfg.color,
+            backgroundColor: cfg.color + '20',
+            fill: false, tension: 0.1, pointRadius: 2, borderWidth: 2,
+        });
+    }
+}
+
+// Build phase band annotations from any timeline
+const refTl = DATA.timelines['sync-default'] || DATA.timelines['gated'] || [];
+const phaseBands = [];
+let prevPhase = '';
+for (const t of refTl) {
+    if (t.phase !== prevPhase) {
+        phaseBands.push({x: t.elapsed, phase: t.phase});
+        prevPhase = t.phase;
+    }
+}
+
+const maxElapsed = Math.max(...Object.values(DATA.timelines).flat().map(t => t.elapsed || 0), 1);
+const annotations = {};
+for (let i = 0; i < phaseBands.length; i++) {
+    const start = phaseBands[i].x;
+    const end = i + 1 < phaseBands.length ? phaseBands[i + 1].x : maxElapsed;
+    const isBurst = phaseBands[i].phase.includes('BURST');
+    annotations['band' + i] = {
+        type: 'box', xMin: start, xMax: end,
+        backgroundColor: isBurst ? 'rgba(239,68,68,0.08)' : 'rgba(34,197,94,0.06)',
+        borderWidth: 0,
+        label: {
+            display: true,
+            content: phaseBands[i].phase.replace(/Phase \d+: /, '').split('(')[0].trim(),
+            position: {x: 'center', y: 'start'},
+            font: {size: 10, weight: 'bold'},
+            color: isBurst ? 'rgba(239,68,68,0.5)' : 'rgba(34,197,94,0.4)',
+        }
+    };
+}
+
+new Chart(document.getElementById('timelineChart'), {
+    type: 'line',
+    data: {datasets: timelineDatasets},
+    options: {
+        responsive: true,
+        plugins: {
+            title: {display: true, text: 'Batch Requests Completed Over Time', font: {size: 16}},
+            annotation: {annotations}
+        },
+        scales: {
+            x: {type: 'linear', title: {display: true, text: 'Time (seconds)'}},
+            y: {title: {display: true, text: 'Batch Requests Completed'}, beginAtZero: true}
+        }
+    }
+});
+
+// Detail table
+const tbody = document.getElementById('detailTable');
+for (const rate of rates) {
+    for (const sc of ['baseline', 'sync_default', 'sync_aggressive', 'gated']) {
+        const d = (DATA.burst[sc] || {})[String(rate)];
+        if (!d) continue;
+        const tr = document.createElement('tr');
+        const isBurst = true;
+        const cls = sc === 'sync_aggressive' && isBurst ? 'bad' : (sc === 'gated' && isBurst ? 'good' : '');
+        if (cls) tr.className = cls;
+        tr.innerHTML = `
+            <td>${rate}</td>
+            <td>${LABELS[sc]}</td>
+            <td>${d.Successful || 0}</td>
+            <td>${d.Incomplete || 0}</td>
+            <td>${d.Errored || 0}</td>
+            <td>${parseFloat(d.ttft_med || 0).toFixed(1)}</td>
+            <td>${(d.ttft_p95 || 0).toFixed ? parseFloat(d.ttft_p95 || 0).toFixed(1) : 'N/A'}</td>
+            <td>${(d.ttft_p99 || 0).toFixed ? parseFloat(d.ttft_p99 || 0).toFixed(1) : 'N/A'}</td>
+            <td>${parseFloat(d.itl || 0).toFixed(1)}</td>
+            <td>${parseFloat(d.lat || 0).toFixed(2)}</td>
+        `;
+        tbody.appendChild(tr);
+    }
+}
+</script>
+</body>
+</html>

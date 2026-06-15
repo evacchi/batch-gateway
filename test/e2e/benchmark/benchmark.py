@@ -290,16 +290,16 @@ def submit_batch(cfg: ScenarioConfig, job_name="batch-submit"):
 
 def start_burst(cfg: ScenarioConfig):
     rates_str = "/".join(str(r) for r in cfg.burst_rates)
-    log(f"Starting burst pattern in {cfg.namespace}: rates [{rates_str}] req/s, "
-        f"burst {cfg.burst_seconds}s, idle@{cfg.idle_rate}/s for {cfg.idle_seconds}s")
+    log(f"Starting burst pattern in {cfg.namespace}: concurrent [{rates_str}], "
+        f"burst {cfg.burst_seconds}s, idle@{cfg.idle_rate} concurrent for {cfg.idle_seconds}s")
 
     cycle_lines = []
     for c, rate in enumerate(cfg.burst_rates, 1):
         cycle_lines.extend([
-            f'echo "=== Phase {c}: IDLE ({cfg.idle_rate} req/s, {cfg.idle_seconds}s) ==="',
-            f'guidellm benchmark run --target "$T" $COMMON --profile constant --rate {cfg.idle_rate} --max-seconds {cfg.idle_seconds} --output-dir /results/{cfg.name} --outputs "idle-{c}.csv"',
-            f'echo "=== Phase {c}: BURST ({rate} req/s, {cfg.burst_seconds}s) ==="',
-            f'guidellm benchmark run --target "$T" $COMMON --profile constant --rate {rate} --max-seconds {cfg.burst_seconds} --output-dir /results/{cfg.name} --outputs "burst-{c}.csv"',
+            f'echo "=== Phase {c}: IDLE ({cfg.idle_rate} concurrent, {cfg.idle_seconds}s) ==="',
+            f'guidellm benchmark run --target "$T" $COMMON --profile concurrent --rate {cfg.idle_rate} --max-seconds {cfg.idle_seconds} --output-dir /results/{cfg.name} --outputs "idle-{c}.csv"',
+            f'echo "=== Phase {c}: BURST ({rate} concurrent, {cfg.burst_seconds}s) ==="',
+            f'guidellm benchmark run --target "$T" $COMMON --profile concurrent --rate {rate} --max-seconds {cfg.burst_seconds} --output-dir /results/{cfg.name} --outputs "burst-{c}.csv"',
         ])
 
     script_lines = [
@@ -986,9 +986,10 @@ def main():
     parser.add_argument("--sync-namespace", default="", help="Namespace for sync scenario (omit to skip)")
     parser.add_argument("--gated-namespace", default="", help="Namespace for gated scenario (omit to skip)")
     parser.add_argument("--batch-size", type=int, default=50)
-    parser.add_argument("--burst-rates", type=int, nargs="+", default=[15],
-                        help="Burst rates in req/s (one per phase)")
-    parser.add_argument("--idle-rate", type=int, default=1)
+    parser.add_argument("--burst-rates", type=int, nargs="+", default=[50],
+                        help="Concurrent requests per burst phase (one per phase)")
+    parser.add_argument("--idle-rate", type=int, default=5,
+                        help="Concurrent requests during idle phases")
     parser.add_argument("--burst-seconds", type=int, default=60)
     parser.add_argument("--idle-seconds", type=int, default=120)
     parser.add_argument("--num-batches", type=int, default=1,
@@ -1025,8 +1026,8 @@ def main():
 
     rates_str = "/".join(str(r) for r in args.burst_rates)
     log("=== Starting benchmark ===")
-    log(f"Burst rates: [{rates_str}] req/s for {args.burst_seconds}s each, "
-        f"Idle: {args.idle_rate} req/s for {args.idle_seconds}s, "
+    log(f"Burst concurrency: [{rates_str}] for {args.burst_seconds}s each, "
+        f"Idle: {args.idle_rate} concurrent for {args.idle_seconds}s, "
         f"{args.num_batches}x{args.batch_size} batch requests")
 
     sync_timeline, sync_csvs = [], []

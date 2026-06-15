@@ -4,5 +4,5 @@ processor:
     asyncDispatch:
       resultPollTimeout: "30s"
     modelGateways:
-      Qwen/Qwen3-32B-AWQ:
+      Qwen/Qwen3-8B:
         inferencePoolName: "optimized-baseline"
