@@ -14,3 +14,9 @@ processor:
         maxRetries: 3
         initialBackoff: "1s"
         maxBackoff: "60s"
+      Qwen/Qwen3-32B-AWQ:
+        url: "http://llm-d-inference-gateway-istio:80"
+        requestTimeout: "5m"
+        maxRetries: 3
+        initialBackoff: "1s"
+        maxBackoff: "60s"

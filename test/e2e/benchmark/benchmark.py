@@ -37,6 +37,7 @@ class ScenarioConfig:
     idle_seconds: int
     cycles: int
     batch_size: int
+    num_batches: int = 1
     prompt_tokens: int = 1500
     target: str = "http://llm-d-inference-gateway-istio"
     model: str = "Qwen/Qwen3-8B"
@@ -85,9 +86,9 @@ def log(msg):
 def cleanup_namespace(context, namespace):
     log(f"Cleaning up {namespace}")
 
-    kubectl(["delete", "job", "guidellm-burst", "batch-submit", "batch-submit-2",
-             "--ignore-not-found"], context, namespace, check=False)
-    kubectl(["delete", "configmap", "batch-submit-script", "batch-submit-2-script",
+    kubectl(["delete", "job", "--all", "--ignore-not-found"],
+            context, namespace, check=False)
+    kubectl(["delete", "configmap", "-l", "batch-benchmark=true",
              "--ignore-not-found"], context, namespace, check=False)
 
     kubectl(["scale", "deployment",
@@ -162,7 +163,9 @@ def _batch_script():
                     },
                 })
                 f.write(line + "\\n")
-        print(f"Generated {batch_size} requests (~{prompt_chars} chars each)")
+                if (i + 1) % 500 == 0:
+                    print(f"  Generated {i + 1}/{batch_size}", flush=True)
+        print(f"Generated {batch_size} requests (~{prompt_chars} chars each)", flush=True)
 
         boundary = "----BatchBoundary"
         with open(jsonl_path, "rb") as f:
@@ -227,7 +230,7 @@ def _batch_script():
 
 
 def submit_batch(cfg: ScenarioConfig, job_name="batch-submit"):
-    prompt_chars = cfg.prompt_tokens * 5
+    prompt_chars = cfg.prompt_tokens * 4
     log(f"Submitting {cfg.batch_size}-request batch ({job_name}) in {cfg.namespace} "
         f"(~{cfg.prompt_tokens} tokens/request, faker prompts)")
     script = _batch_script()
@@ -238,6 +241,8 @@ def submit_batch(cfg: ScenarioConfig, job_name="batch-submit"):
     kind: Job
     metadata:
       name: {job_name}
+      labels:
+        batch-benchmark: "true"
     spec:
       backoffLimit: 0
       template:
@@ -255,7 +260,11 @@ def submit_batch(cfg: ScenarioConfig, job_name="batch-submit"):
                   value: "{cfg.batch_size}"
                 - name: PROMPT_CHARS
                   value: "{prompt_chars}"
-              command: ["sh", "-c", "pip install -q faker && python3 /tmp/script.py"]
+              command: ["sh", "-c", "pip install -q faker && python3 -u /tmp/script.py"]
+              resources:
+                requests:
+                  cpu: "2"
+                  memory: 512Mi
               volumeMounts:
                 - name: script
                   mountPath: /tmp/script.py
@@ -271,6 +280,8 @@ def submit_batch(cfg: ScenarioConfig, job_name="batch-submit"):
     kind: ConfigMap
     metadata:
       name: {job_name}-script
+      labels:
+        batch-benchmark: "true"
     data:
       script.py: |
     """) + indented + "\n"
@@ -394,7 +405,7 @@ def monitor_scenario(cfg: ScenarioConfig):
     timeline = []
     start = time.time()
     second_batch_submitted = False
-    batch_jobs = ["batch-submit"]
+    batch_jobs = [f"batch-submit-{i}" for i in range(cfg.num_batches)]
 
     while True:
         elapsed = time.time() - start
@@ -420,8 +431,9 @@ def monitor_scenario(cfg: ScenarioConfig):
         # Submit a second batch during the first burst
         if not second_batch_submitted and "BURST" in phase:
             log(f"  [{cfg.name}] Submitting overlapping batch during burst")
-            submit_batch(cfg, job_name="batch-submit-2")
-            batch_jobs.append("batch-submit-2")
+            for i in range(cfg.num_batches):
+                submit_batch(cfg, job_name=f"batch-overlap-{i}")
+                batch_jobs.append(f"batch-overlap-{i}")
             second_batch_submitted = True
 
         timeline.append({
@@ -953,7 +965,8 @@ def run_scenario(cfg: ScenarioConfig, results_dir: Path):
     except subprocess.CalledProcessError:
         log(f"  WARNING: vLLM not ready in {cfg.namespace}")
 
-    submit_batch(cfg)
+    for i in range(cfg.num_batches):
+        submit_batch(cfg, job_name=f"batch-submit-{i}")
     time.sleep(10)
     start_burst(cfg)
     time.sleep(30)  # let guidellm validate and start
@@ -974,6 +987,8 @@ def main():
     parser.add_argument("--burst-seconds", type=int, default=60)
     parser.add_argument("--idle-seconds", type=int, default=120)
     parser.add_argument("--cycles", type=int, default=2)
+    parser.add_argument("--num-batches", type=int, default=1,
+                        help="Number of concurrent batches to submit")
     parser.add_argument("--prompt-tokens", type=int, default=1500,
                         help="Input tokens per request (batch and live traffic)")
     parser.add_argument("--results-dir", type=Path, default=Path("./benchmark-results"))
@@ -990,7 +1005,8 @@ def main():
             burst_rate=args.burst_rate, idle_rate=args.idle_rate,
             burst_seconds=args.burst_seconds, idle_seconds=args.idle_seconds,
             cycles=args.cycles,
-            batch_size=args.batch_size, prompt_tokens=args.prompt_tokens,
+            batch_size=args.batch_size, num_batches=args.num_batches,
+            prompt_tokens=args.prompt_tokens,
             target=args.target, model=args.model,
         )
     gated_cfg = None
@@ -1000,14 +1016,15 @@ def main():
             burst_rate=args.burst_rate, idle_rate=args.idle_rate,
             burst_seconds=args.burst_seconds, idle_seconds=args.idle_seconds,
             cycles=args.cycles,
-            batch_size=args.batch_size, prompt_tokens=args.prompt_tokens,
+            batch_size=args.batch_size, num_batches=args.num_batches,
+            prompt_tokens=args.prompt_tokens,
             target=args.target, model=args.model,
         )
 
     log("=== Starting benchmark ===")
     log(f"Burst: {args.burst_rate} req/s for {args.burst_seconds}s, "
         f"Idle: {args.idle_rate} req/s for {args.idle_seconds}s, "
-        f"{args.cycles} cycles, {args.batch_size} batch requests")
+        f"{args.cycles} cycles, {args.num_batches}x{args.batch_size} batch requests")
 
     # Run scenarios sequentially (they use separate namespaces but share GPU nodes)
     sync_timeline, sync_csvs = [], []

@@ -213,6 +213,13 @@ helm install batch-gateway ${BATCH_REPO}/charts/batch-gateway/ \
     -n ${NAMESPACE}
 ```
 
+After installing, set `TMPDIR` on the apiserver so that large file uploads
+(which spill to disk) work with the read-only root filesystem:
+
+```bash
+kubectl set env deploy/batch-gateway-apiserver TMPDIR=/tmp/batch-gateway -n ${NAMESPACE}
+```
+
 ## Step 13: Deploy async processor with dispatch budget gate
 
 The async processor dispatches batch requests through the inference gateway,
@@ -278,17 +285,36 @@ kubectl run --rm -i test-gateway --image=curlimages/curl --restart=Never \
 kubectl apply -n ${NAMESPACE} -f ${BATCH_REPO}/test/e2e/benchmark/results-pvc.yaml
 ```
 
+## Quick setup / teardown
+
+Instead of following Steps 1–15 manually, use the provided scripts to deploy
+and tear down the full stack in both namespaces:
+
+```bash
+export KUBE_CONTEXT=my-cluster
+export SYNC_NAMESPACE=my-sync-ns
+export GATED_NAMESPACE=my-gated-ns
+export LLM_D_REPO=/path/to/llm-d
+export ASYNC_REPO=/path/to/llm-d-async
+export ROUTER_REPO=/path/to/llm-d-router
+
+# Deploy everything (CRDs, Istio, and Prometheus must already be installed)
+bash ${BATCH_REPO}/test/e2e/benchmark/setup.sh
+
+# ... run the benchmark ...
+
+# Tear down and release GPUs
+bash ${BATCH_REPO}/test/e2e/benchmark/teardown.sh
+```
+
+Optional overrides: `GUIDE_NAME`, `MAX_CONCURRENCY`, `AP_IMAGE_REPO`,
+`AP_IMAGE_TAG`, `BG_IMAGE_REPO`, `BG_IMAGE_TAG` — see `setup.sh` header.
+
 ## Step 16: Run the benchmark
 
 The benchmark requires **two namespaces** — one for sync dispatch, one for
-gated async dispatch. Deploy the full stack (Steps 1–15) in both namespaces,
-configuring the sync namespace with `processor-sync-values.yaml` and the
-async namespace with `processor-async-values.yaml`.
-
-```bash
-export SYNC_NAMESPACE=my-sync-ns
-export GATED_NAMESPACE=my-gated-ns
-```
+gated async dispatch. Deploy the full stack (Steps 1–15, or use `setup.sh`)
+in both namespaces.
 
 Run the benchmark script:
 
@@ -386,6 +412,14 @@ Edit `benchmark.py` parameters or the inline Job YAML to change:
 > as CLI flags, which causes unexpected behavior.
 
 ## Cleanup
+
+Use the teardown script to remove everything and release GPUs:
+
+```bash
+bash ${BATCH_REPO}/test/e2e/benchmark/teardown.sh
+```
+
+Or manually:
 
 ```bash
 kubectl delete job guidellm-sweep batch-submit -n ${NAMESPACE} --ignore-not-found
