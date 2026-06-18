@@ -34,6 +34,9 @@ import (
 
 var _ AsyncInferenceClient = (*asyncProducerClient)(nil)
 
+// defaultResultBufferSize is the per-job channel capacity for async results.
+const defaultResultBufferSize = 100
+
 // resultDispatcher reads results from the producer's shared result queue and
 // routes them to the correct caller by request ID. The processor dispatches
 // multiple requests per model concurrently, and results arrive in any order,
@@ -43,6 +46,7 @@ type resultDispatcher struct {
 	logger   logr.Logger
 	waiters  sync.Map // requestID -> chan<- *GenerateResponse
 	once     sync.Once
+	wg       sync.WaitGroup
 	cancel   context.CancelFunc
 }
 
@@ -57,11 +61,18 @@ func (d *resultDispatcher) ensureStarted() {
 	d.once.Do(func() {
 		ctx, cancel := context.WithCancel(context.Background())
 		d.cancel = cancel
+		d.wg.Add(1)
 		go d.run(ctx)
 	})
 }
 
 func (d *resultDispatcher) run(ctx context.Context) {
+	defer d.wg.Done()
+	defer func() {
+		if r := recover(); r != nil {
+			d.logger.Error(fmt.Errorf("%v", r), "Panic in result dispatcher")
+		}
+	}()
 	for {
 		pollCtx, pollCancel := context.WithTimeout(ctx, time.Second)
 		result, err := d.producer.GetResult(pollCtx)
@@ -85,10 +96,10 @@ func (d *resultDispatcher) run(ctx context.Context) {
 			select {
 			case ch <- resp:
 			default:
-				d.logger.V(logging.TRACE).Info("Result channel full, dropping result", "resultID", result.ID)
+				d.logger.Info("Result channel full, dropping result", "resultID", result.ID)
 			}
 		} else {
-			d.logger.V(logging.TRACE).Info("Dropped result with no waiter", "resultID", result.ID)
+			d.logger.Info("Dropped result with no waiter", "resultID", result.ID)
 		}
 	}
 }
@@ -105,6 +116,15 @@ func (d *resultDispatcher) unregister(requestID string) {
 func (d *resultDispatcher) Close() error {
 	if d.cancel != nil {
 		d.cancel()
+		done := make(chan struct{})
+		go func() {
+			d.wg.Wait()
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+		}
 	}
 	return nil
 }
@@ -112,9 +132,10 @@ func (d *resultDispatcher) Close() error {
 // asyncPool holds the shared resources for one inference pool.
 // Multiple per-job clients share the same pool.
 type asyncPool struct {
-	producer   producer.Producer
-	dispatcher *resultDispatcher
-	logger     logr.Logger
+	producer        producer.Producer
+	dispatcher      *resultDispatcher
+	logger          logr.Logger
+	defaultDeadline time.Duration
 }
 
 // asyncProducerClient is a per-job client that submits requests and collects
@@ -130,7 +151,7 @@ type asyncProducerClient struct {
 func newAsyncProducerClient(pool *asyncPool) *asyncProducerClient {
 	return &asyncProducerClient{
 		pool:    pool,
-		results: make(chan *GenerateResponse, 100),
+		results: make(chan *GenerateResponse, defaultResultBufferSize),
 		logger:  pool.logger,
 	}
 }
@@ -139,7 +160,11 @@ func newAsyncProducerClient(pool *asyncPool) *asyncProducerClient {
 // to this client's internal channel by the shared dispatcher.
 func (c *asyncProducerClient) Submit(ctx context.Context, req *GenerateRequest) *ClientError {
 	now := time.Now()
-	deadline := now.Add(5 * time.Minute)
+	fallback := c.pool.defaultDeadline
+	if fallback == 0 {
+		fallback = 5 * time.Minute
+	}
+	deadline := now.Add(fallback)
 	if dl, ok := ctx.Deadline(); ok {
 		deadline = dl
 	}

@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"time"
 
 	"github.com/go-logr/logr"
 	"github.com/llm-d-incubation/llm-d-async/producer"
@@ -30,8 +31,9 @@ const asyncQueuePrefix = "llm-d-async:"
 
 // AsyncClientConfig holds the resolved configuration for async dispatch.
 type AsyncClientConfig struct {
-	RedisURL string
-	Models   map[string]string // model name -> pool name
+	RedisURL        string
+	Models          map[string]string // model name -> pool name
+	DefaultDeadline time.Duration     // fallback deadline when ctx has none; 0 defaults to 5m
 }
 
 // AsyncGatewayResolver routes models to per-job AsyncInferenceClient instances.
@@ -83,7 +85,7 @@ func NewAsyncResolver(config AsyncClientConfig, logger logr.Logger) (*AsyncGatew
 	}
 
 	pools := make(map[string]*asyncPool, len(config.Models))
-	closers := []io.Closer{rdb}
+	var closers []io.Closer
 
 	for model, poolName := range config.Models {
 		p, err := producer.NewRedisSortedSetProducer(
@@ -97,16 +99,19 @@ func NewAsyncResolver(config AsyncClientConfig, logger logr.Logger) (*AsyncGatew
 			for _, c := range closers {
 				_ = c.Close()
 			}
+			_ = rdb.Close()
 			return nil, fmt.Errorf("failed to create producer for model %q (pool %s): %w", model, poolName, err)
 		}
 
 		poolLogger := logger.WithName("async-inference").WithValues("pool", poolName)
 		d := newResultDispatcher(p, poolLogger)
-		pool := &asyncPool{producer: p, dispatcher: d, logger: poolLogger}
+		pool := &asyncPool{producer: p, dispatcher: d, logger: poolLogger, defaultDeadline: config.DefaultDeadline}
 
 		pools[model] = pool
 		closers = append(closers, d, p)
 	}
+
+	closers = append(closers, rdb)
 
 	return &AsyncGatewayResolver{pools: pools, closers: closers}, nil
 }

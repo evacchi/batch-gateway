@@ -23,6 +23,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 
 	"github.com/go-logr/logr"
 	dbapi "github.com/llm-d/llm-d-batch-gateway/internal/database/api"
@@ -187,7 +188,9 @@ func WithPerModelInference(cfgs map[string]inference.GatewayClientConfig) Option
 
 // WithAsyncInference enables async dispatch via llm-d-async queues.
 func WithAsyncInference(cfg inference.AsyncClientConfig) Option {
-	return func(c *clientsetConfig) { c.asyncInference = &cfg }
+	copied := cfg
+	copied.Models = maps.Clone(cfg.Models)
+	return func(c *clientsetConfig) { c.asyncInference = &copied }
 }
 
 // NewClientset creates the clients specified by the given options.
