@@ -21,9 +21,19 @@ PID_FILE="${REPO_ROOT}/.dispatcher-port-forward.pid"
 DISPATCHER_SOURCE="${DISPATCHER_SOURCE:-}"
 
 # ── Prerequisites ────────────────────────────────────────────────────────────
-for cmd in kubectl helm kind docker jq nc; do
+for cmd in kubectl helm kind jq nc; do
     command -v "$cmd" &>/dev/null || die "Missing required tool: $cmd"
 done
+
+if [[ -n "${CONTAINER_TOOL:-}" ]]; then
+    : # caller specified
+elif command -v docker &>/dev/null && docker info &>/dev/null 2>&1; then
+    CONTAINER_TOOL="docker"
+elif command -v podman &>/dev/null; then
+    CONTAINER_TOOL="podman"
+else
+    die "Neither docker (running) nor podman found. Please install one."
+fi
 
 if ! kind get clusters 2>/dev/null | grep -qx "${KIND_CLUSTER_NAME}"; then
     die "Kind cluster '${KIND_CLUSTER_NAME}' not found. Run 'make dev-deploy' first."
@@ -38,14 +48,23 @@ if [[ -n "${DISPATCHER_SOURCE}" ]]; then
     DISPATCHER_CHART="${DISPATCHER_SOURCE}/charts/async-processor"
     unset DISPATCHER_CHART_VERSION
     step "Building async-processor image from ${DISPATCHER_SOURCE}..."
-    docker build -t "${DISPATCHER_IMAGE}" "${DISPATCHER_SOURCE}"
+    ${CONTAINER_TOOL} build -t "${DISPATCHER_IMAGE}" "${DISPATCHER_SOURCE}"
 else
-    step "Pulling dispatcher image ${DISPATCHER_IMAGE}..."
-    docker pull "${DISPATCHER_IMAGE}"
+    if ${CONTAINER_TOOL} image exists "${DISPATCHER_IMAGE}" 2>/dev/null || \
+       ${CONTAINER_TOOL} inspect "${DISPATCHER_IMAGE}" &>/dev/null; then
+        step "Using local dispatcher image ${DISPATCHER_IMAGE}"
+    else
+        step "Pulling dispatcher image ${DISPATCHER_IMAGE}..."
+        ${CONTAINER_TOOL} pull "${DISPATCHER_IMAGE}"
+    fi
 fi
 
 step "Loading dispatcher image into Kind cluster '${KIND_CLUSTER_NAME}'..."
-kind load docker-image "${DISPATCHER_IMAGE}" --name "${KIND_CLUSTER_NAME}"
+if [[ "${CONTAINER_TOOL}" == "docker" ]]; then
+    kind load docker-image "${DISPATCHER_IMAGE}" --name "${KIND_CLUSTER_NAME}"
+else
+    ${CONTAINER_TOOL} save "${DISPATCHER_IMAGE}" | kind load image-archive /dev/stdin --name "${KIND_CLUSTER_NAME}"
+fi
 
 # ── Deploy async-processor via Helm ──────────────────────────────────────────
 HELM_VALUES="${REPO_ROOT}/test/e2e/dispatcher/helm-values.yaml"
