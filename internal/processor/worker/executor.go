@@ -278,35 +278,22 @@ func (p *Processor) executeJob(ctx, sloCtx, userCancelCtx, requestAbortCtx conte
 		// Ordering guarantee: processModel returns → requestAbortFn → errCh send.
 		// This ensures the first real error reaches errCh before any context.Canceled
 		// from other models whose contexts were cancelled by requestAbortFn.
+		mp := p.makeModelProcessor()
+
 		go func(safeModelID, modelID string) {
-			var err error
-			if p.asyncInference != nil {
-				err = p.processModelAsync(
-					requestAbortCtx,
-					ctx,
-					sloCtx,
-					userCancelCtx,
-					inputFile,
-					plansDir, safeModelID, modelID,
-					writers,
-					progress,
-					passThroughHeaders,
-					tenantID,
-				)
-			} else {
-				err = p.processModel(
-					requestAbortCtx,
-					ctx,
-					sloCtx,
-					userCancelCtx,
-					inputFile,
-					plansDir, safeModelID, modelID,
-					writers,
-					progress,
-					passThroughHeaders,
-					tenantID,
-				)
-			}
+			err := mp.submit(
+				requestAbortCtx,
+				ctx,
+				sloCtx,
+				userCancelCtx,
+				inputFile,
+				plansDir, safeModelID, modelID,
+				writers,
+				progress,
+				passThroughHeaders,
+				tenantID,
+			)
+
 			// Abort all sibling models when any model hits a fatal I/O error
 			// (e.g. output file write failure). modelErr is only set for local
 			// I/O failures — not inference errors, which are recorded normally
@@ -387,6 +374,14 @@ func (p *Processor) executeJob(ctx, sloCtx, userCancelCtx, requestAbortCtx conte
 	}
 
 	return counts, nil
+}
+
+func (p *Processor) makeModelProcessor() modelProcessor {
+	if p.asyncInference == nil {
+		return &syncModelProcessor{processor: p}
+	} else {
+		return &asyncModelProcessor{processor: p}
+	}
 }
 
 // processModel processes all plan entries for a single model concurrently.
@@ -1150,4 +1145,84 @@ func jsonNumericToFloat64(v interface{}) (float64, bool) {
 // requestID is also passed to the inference client so the two can be correlated in logs.
 func newBatchRequestID(requestID string) string {
 	return fmt.Sprintf("batch_req_%s", requestID)
+}
+
+type modelProcessor interface {
+	submit(
+		requestAbortCtx context.Context,
+		mainCtx context.Context,
+		sloCtx context.Context,
+		userCancelCtx context.Context,
+		inputFile *os.File,
+		plansDir, safeModelID, modelID string,
+		writers *outputWriters,
+		progress *executionProgress,
+		passThroughHeaders map[string]string,
+		tenantID string,
+	) error
+	collect()
+}
+
+type syncModelProcessor struct {
+	processor *Processor
+}
+
+func (p *syncModelProcessor) submit(
+	requestAbortCtx context.Context,
+	mainCtx context.Context,
+	sloCtx context.Context,
+	userCancelCtx context.Context,
+	inputFile *os.File,
+	plansDir, safeModelID, modelID string,
+	writers *outputWriters,
+	progress *executionProgress,
+	passThroughHeaders map[string]string,
+	tenantID string) error {
+	return p.processor.processModel(
+		requestAbortCtx,
+		mainCtx,
+		sloCtx,
+		userCancelCtx,
+		inputFile,
+		plansDir, safeModelID, modelID,
+		writers,
+		progress,
+		passThroughHeaders,
+		tenantID)
+}
+
+func (p *syncModelProcessor) collect() {
+
+}
+
+type asyncModelProcessor struct {
+	processor *Processor
+}
+
+func (p *asyncModelProcessor) submit(
+	requestAbortCtx context.Context,
+	mainCtx context.Context,
+	sloCtx context.Context,
+	userCancelCtx context.Context,
+	inputFile *os.File,
+	plansDir, safeModelID, modelID string,
+	writers *outputWriters,
+	progress *executionProgress,
+	passThroughHeaders map[string]string,
+	tenantID string) error {
+	return p.processor.processModelAsync(
+		requestAbortCtx,
+		mainCtx,
+		sloCtx,
+		userCancelCtx,
+		inputFile,
+		plansDir, safeModelID, modelID,
+		writers,
+		progress,
+		passThroughHeaders,
+		tenantID)
+}
+
+func (p *asyncModelProcessor) collect() {
+
 }
