@@ -362,14 +362,21 @@ func (c *ProcessorConfig) Validate() error {
 		return fmt.Errorf("progress_ttl_seconds must be > 0")
 	}
 
-	if err := c.validateDispatchMode(); err != nil {
+	if err := c.validateGateways(); err != nil {
 		return err
 	}
 
 	return nil
 }
 
-func (c *ProcessorConfig) validateDispatchMode() error {
+func (c *ProcessorConfig) validateGateways() error {
+	if c.GlobalInferenceGateway == nil && len(c.ModelGateways) == 0 {
+		return fmt.Errorf("either global_inference_gateway or model_gateways must be configured")
+	}
+	if c.GlobalInferenceGateway != nil && len(c.ModelGateways) > 0 {
+		return fmt.Errorf("global_inference_gateway and model_gateways are mutually exclusive")
+	}
+
 	switch c.DispatchMode {
 	case DispatchModeSync, DispatchMode(""):
 		c.DispatchMode = DispatchModeSync
@@ -381,21 +388,7 @@ func (c *ProcessorConfig) validateDispatchMode() error {
 	}
 }
 
-func (c *ProcessorConfig) validateGateways() error {
-	if c.GlobalInferenceGateway == nil && len(c.ModelGateways) == 0 {
-		return fmt.Errorf("either global_inference_gateway or model_gateways must be configured")
-	}
-	if c.GlobalInferenceGateway != nil && len(c.ModelGateways) > 0 {
-		return fmt.Errorf("global_inference_gateway and model_gateways are mutually exclusive")
-	}
-	return nil
-}
-
 func (c *ProcessorConfig) validateSyncDispatchConfig() error {
-	if err := c.validateGateways(); err != nil {
-		return err
-	}
-
 	if c.GlobalInferenceGateway != nil {
 		if err := validateGatewayConfig("global_inference_gateway", *c.GlobalInferenceGateway); err != nil {
 			return err
