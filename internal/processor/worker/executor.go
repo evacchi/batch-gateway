@@ -284,11 +284,7 @@ func (p *Processor) executeJob(ctx, sloCtx, userCancelCtx, requestAbortCtx conte
 	progress.failed.Store(modelMap.RejectedCount)
 
 	pw := newProgressWorker(ctx, writers, progress)
-
-	pwErrCh := make(chan error, 1)
-	go func() { pwErrCh <- pw.run() }()
-
-	errCh := make(chan error, len(modelMap.SafeToModel))
+	go pw.run()
 
 	passThroughHeaders := params.jobInfo.PassThroughHeaders
 	if len(passThroughHeaders) > 0 {
@@ -301,11 +297,13 @@ func (p *Processor) executeJob(ctx, sloCtx, userCancelCtx, requestAbortCtx conte
 
 	tenantID := params.jobInfo.TenantID
 
+	processors := make([]modelProcessor, 0, len(modelMap.SafeToModel))
 	for safeModelID, modelID := range modelMap.SafeToModel {
 		mp := p.makeModelProcessor()
+		processors = append(processors, mp)
 
-		go func(safeModelID, modelID string) {
-			err := mp.submit(
+		go func(mp modelProcessor, safeModelID, modelID string) {
+			mp.submit(
 				requestAbortCtx,
 				ctx,
 				sloCtx,
@@ -316,32 +314,26 @@ func (p *Processor) executeJob(ctx, sloCtx, userCancelCtx, requestAbortCtx conte
 				passThroughHeaders,
 				tenantID,
 			)
-			if err == nil {
-				err = mp.collect(
-					requestAbortCtx,
-					inputFile,
-					pw,
-				)
-			}
-
-			if err != nil {
-				if fn := params.requestAbortFn; fn != nil {
-					fn()
-				}
-			}
-			errCh <- err
-		}(safeModelID, modelID)
+			mp.collect(
+				requestAbortCtx,
+				inputFile,
+				pw,
+			)
+		}(mp, safeModelID, modelID)
 	}
 
 	var firstErr error
-	for range modelMap.SafeToModel {
-		if err := <-errCh; err != nil && firstErr == nil {
+	for _, mp := range processors {
+		if err := <-mp.done(); err != nil && firstErr == nil {
 			firstErr = err
+			if fn := params.requestAbortFn; fn != nil {
+				fn()
+			}
 		}
 	}
 
 	pw.close()
-	pwErr := <-pwErrCh
+	pwErr := <-pw.errCh
 
 	progress.flush(ctx)
 
@@ -381,10 +373,9 @@ func (p *Processor) executeJob(ctx, sloCtx, userCancelCtx, requestAbortCtx conte
 
 func (p *Processor) makeModelProcessor() modelProcessor {
 	if p.asyncInference == nil {
-		return &syncModelProcessor{processor: p}
-	} else {
-		return &asyncModelProcessor{processor: p}
+		return &syncModelProcessor{processor: p, errCh: make(chan error, 1)}
 	}
+	return &asyncModelProcessor{processor: p, errCh: make(chan error, 1)}
 }
 
 // drainAndFinalize drains undispatched entries based on the stop reason and
@@ -641,6 +632,7 @@ type resultItem struct {
 
 type progressWorker struct {
 	ch       chan resultItem
+	errCh    chan error
 	writers  *outputWriters
 	progress *executionProgress
 	ctx      context.Context
@@ -649,6 +641,7 @@ type progressWorker struct {
 func newProgressWorker(ctx context.Context, writers *outputWriters, progress *executionProgress) *progressWorker {
 	return &progressWorker{
 		ch:       make(chan resultItem, 256),
+		errCh:    make(chan error, 1),
 		writers:  writers,
 		progress: progress,
 		ctx:      ctx,
@@ -663,7 +656,7 @@ func (pw *progressWorker) close() {
 	close(pw.ch)
 }
 
-func (pw *progressWorker) run() error {
+func (pw *progressWorker) run() {
 	var firstErr error
 	for item := range pw.ch {
 		if firstErr != nil {
@@ -679,7 +672,7 @@ func (pw *progressWorker) run() error {
 	if err := pw.writers.errors.Flush(); err != nil && firstErr == nil {
 		firstErr = fmt.Errorf("failed to flush error file: %w", err)
 	}
-	return firstErr
+	pw.errCh <- firstErr
 }
 
 func (pw *progressWorker) counts() *openai.BatchRequestCounts {
@@ -889,11 +882,16 @@ type modelProcessor interface {
 		inputFile *os.File,
 		pw *progressWorker,
 	) error
+	done() chan error
 }
 
 type syncModelProcessor struct {
 	processor *Processor
+	errCh     chan error
+	submitErr error
 }
+
+func (s *syncModelProcessor) done() chan error { return s.errCh }
 
 func (s *syncModelProcessor) submit(
 	requestAbortCtx context.Context,
@@ -993,7 +991,8 @@ dispatch:
 	wg.Wait()
 
 	reason := resolveStopReason(sloCtx, userCancelCtx, mainCtx, requestAbortCtx, modelErr)
-	return drainAndFinalize(inputFile, entries[dispatchedCount:], pw, modelErr, logger, len(entries), reason)
+	s.submitErr = drainAndFinalize(inputFile, entries[dispatchedCount:], pw, modelErr, logger, len(entries), reason)
+	return s.submitErr
 }
 
 func (s *syncModelProcessor) collect(
@@ -1001,11 +1000,14 @@ func (s *syncModelProcessor) collect(
 	inputFile *os.File,
 	pw *progressWorker,
 ) error {
-	return nil
+	s.errCh <- s.submitErr
+	return s.submitErr
 }
 
 type asyncModelProcessor struct {
 	processor   *Processor
+	errCh       chan error
+	submitErr   error
 	asyncClient inference.AsyncInferenceClient
 	pending     map[string]*pendingRequest
 	entries     []planEntry
@@ -1014,6 +1016,8 @@ type asyncModelProcessor struct {
 	logger      logr.Logger
 	reason      stopReason
 }
+
+func (a *asyncModelProcessor) done() chan error { return a.errCh }
 
 func (a *asyncModelProcessor) submit(
 	requestAbortCtx context.Context,
@@ -1025,7 +1029,9 @@ func (a *asyncModelProcessor) submit(
 	pw *progressWorker,
 	passThroughHeaders map[string]string,
 	tenantID string,
-) error {
+) (submitErr error) {
+	defer func() { a.submitErr = submitErr }()
+
 	p := a.processor
 
 	logger := logr.FromContextOrDiscard(requestAbortCtx).WithValues("model", modelID)
@@ -1107,7 +1113,12 @@ func (a *asyncModelProcessor) collect(
 	inputFile *os.File,
 	pw *progressWorker,
 ) error {
+	if a.submitErr != nil {
+		a.errCh <- a.submitErr
+		return a.submitErr
+	}
 	if a.asyncClient == nil {
+		a.errCh <- nil
 		return nil
 	}
 	defer func() {
@@ -1149,5 +1160,7 @@ func (a *asyncModelProcessor) collect(
 	if modelErr != nil {
 		reason = stopFailed
 	}
-	return drainAndFinalize(inputFile, a.entries[a.submitCount:], pw, modelErr, a.logger, len(a.entries), reason)
+	collectErr := drainAndFinalize(inputFile, a.entries[a.submitCount:], pw, modelErr, a.logger, len(a.entries), reason)
+	a.errCh <- collectErr
+	return collectErr
 }

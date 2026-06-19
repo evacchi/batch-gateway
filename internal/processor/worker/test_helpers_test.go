@@ -47,14 +47,13 @@ func (p *Processor) processModel(
 	tenantID string,
 ) error {
 	pw := newProgressWorker(requestAbortCtx, writers, progress)
-	pwErrCh := make(chan error, 1)
-	go func() { pwErrCh <- pw.run() }()
+	go pw.run()
 
 	mp := &syncModelProcessor{processor: p}
 	err := mp.submit(requestAbortCtx, mainCtx, sloCtx, userCancelCtx, inputFile, plansDir, safeModelID, modelID, pw, passThroughHeaders, tenantID)
 
 	pw.close()
-	pwErr := <-pwErrCh
+	pwErr := <-pw.errCh
 
 	if err == nil {
 		err = pwErr
