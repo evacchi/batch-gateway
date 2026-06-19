@@ -890,7 +890,7 @@ type modelProcessor interface {
 		plansDir, safeModelID, modelID string,
 		passThroughHeaders map[string]string,
 		tenantID string,
-	) error
+	)
 	done() chan error
 }
 
@@ -915,7 +915,8 @@ func (s *syncModelProcessor) submit(
 	plansDir, safeModelID, modelID string,
 	passThroughHeaders map[string]string,
 	tenantID string,
-) (retErr error) {
+) {
+	var retErr error
 	defer func() { s.errCh <- retErr; close(s.errCh) }()
 
 	p := s.processor
@@ -925,7 +926,8 @@ func (s *syncModelProcessor) submit(
 	planPath := filepath.Join(plansDir, safeModelID+".plan")
 	entries, err := readPlanEntries(planPath)
 	if err != nil {
-		return fmt.Errorf("model setup failed: read plan for model %s: %w", modelID, err)
+		retErr = fmt.Errorf("model setup failed: read plan for model %s: %w", modelID, err)
+		return
 	}
 
 	logger.V(logging.INFO).Info("Processing requests for a model", "numEntries", len(entries))
@@ -936,7 +938,7 @@ func (s *syncModelProcessor) submit(
 		logger.V(logging.INFO).Info("No endpoint limit for model (client not in resolver), draining as model_not_found")
 		drainUnprocessedRequests(s.inputFile, entries, s.pw,
 			batch_types.BatchErrorCode(inference.ErrCodeModelNotFound))
-		return nil
+		return
 	}
 	endpointSem := epLimit.sem
 
@@ -1005,7 +1007,7 @@ dispatch:
 	wg.Wait()
 
 	reason := resolveStopReason(sloCtx, userCancelCtx, mainCtx, requestAbortCtx, modelErr)
-	return drainAndFinalize(s.inputFile, entries[dispatchedCount:], s.pw, modelErr, logger, len(entries), reason)
+	retErr = drainAndFinalize(s.inputFile, entries[dispatchedCount:], s.pw, modelErr, logger, len(entries), reason)
 }
 
 func (s *syncModelProcessor) collect(ctx context.Context) error {
@@ -1037,9 +1039,7 @@ func (a *asyncModelProcessor) submit(
 	plansDir, safeModelID, modelID string,
 	passThroughHeaders map[string]string,
 	tenantID string,
-) (submitErr error) {
-	defer func() { a.submitErr = submitErr }()
-
+) {
 	p := a.processor
 
 	logger := logr.FromContextOrDiscard(requestAbortCtx).WithValues("model", modelID)
@@ -1048,7 +1048,8 @@ func (a *asyncModelProcessor) submit(
 	planPath := filepath.Join(plansDir, safeModelID+".plan")
 	entries, err := readPlanEntries(planPath)
 	if err != nil {
-		return fmt.Errorf("model setup failed: read plan for model %s: %w", modelID, err)
+		a.submitErr = fmt.Errorf("model setup failed: read plan for model %s: %w", modelID, err)
+		return
 	}
 
 	logger.V(logging.INFO).Info("Processing requests for model (async)", "numEntries", len(entries))
@@ -1057,7 +1058,7 @@ func (a *asyncModelProcessor) submit(
 	if asyncClient == nil {
 		logger.V(logging.INFO).Info("No async client for model, draining as model_not_found")
 		drainUnprocessedRequests(a.inputFile, entries, a.pw, inference.ErrCodeModelNotFound)
-		return nil
+		return
 	}
 
 	a.asyncClient = asyncClient
@@ -1074,7 +1075,8 @@ func (a *asyncModelProcessor) submit(
 
 		req, batchReqID, parseErr, readErr := readRequestLine(a.inputFile, entry, logger)
 		if readErr != nil {
-			return readErr
+			a.submitErr = readErr
+			return
 		}
 		if parseErr != nil {
 			a.pw.send(resultItem{out: parseErr})
@@ -1096,9 +1098,9 @@ func (a *asyncModelProcessor) submit(
 			Headers:   headers,
 		}
 
-		if submitErr := asyncClient.Submit(requestAbortCtx, inferReq); submitErr != nil {
+		if err := asyncClient.Submit(requestAbortCtx, inferReq); err != nil {
 			out := newErrorOutputLine(batchReqID, req.CustomID,
-				string(submitErr.Category), submitErr.Message)
+				string(err.Category), err.Message)
 			a.pw.send(resultItem{out: out})
 			a.submitCount++
 			continue
@@ -1113,7 +1115,6 @@ func (a *asyncModelProcessor) submit(
 
 	logger.V(logging.INFO).Info("Submit phase complete", "submitted", len(a.pending), "total", a.submitCount)
 	a.reason = resolveStopReason(sloCtx, userCancelCtx, mainCtx, requestAbortCtx, nil)
-	return nil
 }
 
 func (a *asyncModelProcessor) collect(ctx context.Context) (retErr error) {
