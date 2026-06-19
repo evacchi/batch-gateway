@@ -67,6 +67,8 @@ type Processor struct {
 	// and reuses concrete clients for identical endpoint configs.
 	endpointLimits map[inference.InferenceClient]*endpointLimit
 
+	collector *collector
+
 	poller  *Poller
 	updater *StatusUpdater
 
@@ -133,6 +135,9 @@ func (p *Processor) Run(ctx context.Context, onReady func()) error {
 	if err := p.initConcurrencyControls(logger, stopAccepting); err != nil {
 		return err
 	}
+
+	p.collector = newCollector()
+	go p.collector.run(ctx)
 
 	return p.runPollingLoop(pollingCtx, ctx)
 }

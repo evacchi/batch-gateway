@@ -370,6 +370,9 @@ func mustNewProcessor(t *testing.T, cfg *config.ProcessorConfig, clients *client
 		t.Fatalf("global semaphore: %v", err)
 	}
 	initTestEndpointLimits(t, p, cfg)
+	p.collector = newCollector()
+	go p.collector.run(context.Background())
+	t.Cleanup(func() { p.collector.close() })
 	return p
 }
 
@@ -426,6 +429,9 @@ func newTestProcessorEnv(t *testing.T, cfg *config.ProcessorConfig, inferClient 
 		t.Fatalf("global semaphore: %v", err)
 	}
 	initTestEndpointLimits(t, p, cfg)
+	p.collector = newCollector()
+	go p.collector.run(context.Background())
+	t.Cleanup(func() { p.collector.close() })
 	p.poller = NewPoller(pqClient, dbClient)
 
 	return &testProcessorEnv{

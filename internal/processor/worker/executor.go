@@ -158,15 +158,37 @@ func (ep *executionProgress) counts() *openai.BatchRequestCounts {
 	}
 }
 
+type collector struct {
+	ch chan modelResultCollector
+}
+
+func newCollector() *collector {
+	return &collector{ch: make(chan modelResultCollector)}
+}
+
+func (c *collector) send(mp modelResultCollector) {
+	c.ch <- mp
+}
+
+func (c *collector) close() {
+	close(c.ch)
+}
+
+func (c *collector) run(ctx context.Context) {
+	for mp := range c.ch {
+		mp.collect(ctx)
+	}
+}
+
 type stopReason int
 
 const (
 	stopNone         stopReason = iota
-	stopExpired                        // SLO deadline exceeded
-	stopCancelled                      // user-initiated cancel
-	stopFailed                         // modelErr (I/O failure)
-	stopShutdown                       // SIGTERM (mainCtx cancelled)
-	stopSiblingAbort                   // sibling model's error cancelled requestAbortCtx
+	stopExpired                 // SLO deadline exceeded
+	stopCancelled               // user-initiated cancel
+	stopFailed                  // modelErr (I/O failure)
+	stopShutdown                // SIGTERM (mainCtx cancelled)
+	stopSiblingAbort            // sibling model's error cancelled requestAbortCtx
 )
 
 func resolveStopReason(sloCtx, userCancelCtx, mainCtx, requestAbortCtx context.Context, modelErr error) stopReason {
@@ -312,7 +334,7 @@ func (p *Processor) executeJob(ctx, sloCtx, userCancelCtx, requestAbortCtx conte
 				passThroughHeaders,
 				tenantID,
 			)
-			mp.collect(requestAbortCtx)
+			p.collector.send(mp.(modelResultCollector))
 		}(mp, safeModelID, modelID)
 	}
 
@@ -869,8 +891,11 @@ type modelProcessor interface {
 		passThroughHeaders map[string]string,
 		tenantID string,
 	) error
-	collect(ctx context.Context) error
 	done() chan error
+}
+
+type modelResultCollector interface {
+	collect(ctx context.Context) error
 }
 
 type syncModelProcessor struct {
