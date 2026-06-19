@@ -158,6 +158,34 @@ func (ep *executionProgress) counts() *openai.BatchRequestCounts {
 	}
 }
 
+type stopReason int
+
+const (
+	stopNone         stopReason = iota
+	stopExpired                        // SLO deadline exceeded
+	stopCancelled                      // user-initiated cancel
+	stopFailed                         // modelErr (I/O failure)
+	stopShutdown                       // SIGTERM (mainCtx cancelled)
+	stopSiblingAbort                   // sibling model's error cancelled requestAbortCtx
+)
+
+func resolveStopReason(sloCtx, userCancelCtx, mainCtx, requestAbortCtx context.Context, modelErr error) stopReason {
+	switch {
+	case errors.Is(sloCtx.Err(), context.DeadlineExceeded):
+		return stopExpired
+	case userCancelCtx.Err() != nil:
+		return stopCancelled
+	case modelErr != nil:
+		return stopFailed
+	case mainCtx.Err() != nil:
+		return stopShutdown
+	case requestAbortCtx.Err() != nil:
+		return stopSiblingAbort
+	default:
+		return stopNone
+	}
+}
+
 // executeJob performs execution: reads plan files per model, sends inference
 // requests concurrently (one goroutine per model, multiple requests per model), and writes results to
 // output.jsonl (successes) and error.jsonl (failures). Returns request counts for finalization.
@@ -296,9 +324,6 @@ func (p *Processor) executeJob(ctx, sloCtx, userCancelCtx, requestAbortCtx conte
 			if err == nil {
 				err = mp.collect(
 					requestAbortCtx,
-					ctx,
-					sloCtx,
-					userCancelCtx,
 					inputFile,
 					writers,
 					progress,
@@ -528,7 +553,7 @@ dispatch:
 				return
 			}
 
-			if err := writeResult(result, sloCtx, userCancelCtx, requestAbortCtx, writers, progress); err != nil {
+			if err := writeResult(result, sloCtx.Err() == nil && userCancelCtx.Err() != nil, requestAbortCtx, writers, progress); err != nil {
 				errOnce.Do(func() { modelErr = err })
 			}
 		}(entry)
@@ -536,8 +561,9 @@ dispatch:
 
 	wg.Wait()
 
-	return drainAndFinalize(requestAbortCtx, mainCtx, sloCtx, userCancelCtx,
-		inputFile, entries[dispatchedCount:], writers, progress, modelErr, logger, len(entries))
+	reason := resolveStopReason(sloCtx, userCancelCtx, mainCtx, requestAbortCtx, modelErr)
+	return drainAndFinalize(requestAbortCtx,
+		inputFile, entries[dispatchedCount:], writers, progress, modelErr, logger, len(entries), reason)
 }
 
 // processModelAsync processes all plan entries for a single model using the
@@ -672,7 +698,7 @@ func (p *Processor) processModelAsync(
 		}
 
 		out := buildOutputLine(pr.batchReqID, pr.customID, modelID, resp.RequestID, resp, nil, logger)
-		if err := writeResult(out, sloCtx, userCancelCtx, requestAbortCtx, writers, progress); err != nil {
+		if err := writeResult(out, sloCtx.Err() == nil && userCancelCtx.Err() != nil, requestAbortCtx, writers, progress); err != nil {
 			modelErr = err
 			break
 		}
@@ -695,17 +721,15 @@ func (p *Processor) processModelAsync(
 		progress.record(requestAbortCtx, false)
 	}
 
-	return drainAndFinalize(requestAbortCtx, mainCtx, sloCtx, userCancelCtx,
-		inputFile, entries[submitCount:], writers, progress, modelErr, logger, len(entries))
+	reason := resolveStopReason(sloCtx, userCancelCtx, mainCtx, requestAbortCtx, modelErr)
+	return drainAndFinalize(requestAbortCtx,
+		inputFile, entries[submitCount:], writers, progress, modelErr, logger, len(entries), reason)
 }
 
-// drainAndFinalize drains undispatched entries based on termination reason and
-// returns the appropriate sentinel error. Shared by processModel and processModelAsync.
+// drainAndFinalize drains undispatched entries based on the stop reason and
+// returns the appropriate sentinel error.
 func drainAndFinalize(
-	requestAbortCtx context.Context,
-	mainCtx context.Context,
-	sloCtx context.Context,
-	userCancelCtx context.Context,
+	ctx context.Context,
 	inputFile *os.File,
 	undispatched []planEntry,
 	writers *outputWriters,
@@ -713,55 +737,48 @@ func drainAndFinalize(
 	modelErr error,
 	logger logr.Logger,
 	totalEntries int,
+	reason stopReason,
 ) error {
 	var returnErr error
-	switch {
-	case errors.Is(sloCtx.Err(), context.DeadlineExceeded):
-		// SLO deadline fired during dispatch — record remaining requests as expired.
+	switch reason {
+	case stopExpired:
 		if len(undispatched) > 0 {
 			logger.V(logging.INFO).Info("SLO expired: draining undispatched entries", "count", len(undispatched))
-			drainUnprocessedRequests(requestAbortCtx, inputFile, undispatched, writers, progress,
+			drainUnprocessedRequests(ctx, inputFile, undispatched, writers, progress,
 				batch_types.ErrCodeBatchExpired)
 		}
 		returnErr = errExpired
 
-	case userCancelCtx.Err() != nil:
-		// User-initiated cancel — record remaining requests as cancelled.
+	case stopCancelled:
 		if len(undispatched) > 0 {
 			logger.V(logging.INFO).Info("Cancelled: draining undispatched entries", "count", len(undispatched))
-			drainUnprocessedRequests(requestAbortCtx, inputFile, undispatched, writers, progress,
+			drainUnprocessedRequests(ctx, inputFile, undispatched, writers, progress,
 				batch_types.ErrCodeBatchCancelled)
 		}
 		returnErr = errCancelled
 
-	case modelErr != nil:
-		// System error in a model goroutine — record remaining requests as failed.
+	case stopFailed:
 		if len(undispatched) > 0 {
 			logger.V(logging.INFO).Info("Fatal error: draining undispatched entries", "count", len(undispatched))
-			drainUnprocessedRequests(requestAbortCtx, inputFile, undispatched, writers, progress,
+			drainUnprocessedRequests(ctx, inputFile, undispatched, writers, progress,
 				batch_types.ErrCodeBatchFailed)
 		}
 		returnErr = modelErr
 
-	default:
-		if mainCtx.Err() != nil && len(undispatched) > 0 {
-			// Pod shutdown (SIGTERM): main processor context is cancelled.
-			// Do not drain here — startup recovery or the re-enqueued worker
-			// will process these entries from scratch.
+	case stopShutdown:
+		if len(undispatched) > 0 {
 			returnErr = errShutdown
-		} else if requestAbortCtx.Err() != nil && len(undispatched) > 0 {
-			// Sibling model abort: requestAbortCtx was cancelled by another
-			// model's error (requestAbortFn), but this is not SLO/cancel/SIGTERM.
-			// Drain undispatched entries as batch_failed so that
-			// completed + failed == total holds for the job.
+		}
+
+	case stopSiblingAbort:
+		if len(undispatched) > 0 {
 			logger.V(logging.INFO).Info("Sibling abort: draining undispatched entries", "count", len(undispatched))
-			drainUnprocessedRequests(requestAbortCtx, inputFile, undispatched, writers, progress,
+			drainUnprocessedRequests(ctx, inputFile, undispatched, writers, progress,
 				batch_types.ErrCodeBatchFailed)
 		}
 	}
 
-	siblingAbort := returnErr == nil && requestAbortCtx.Err() != nil
-	logger.V(logging.INFO).Info("Finished processing model", "numEntries", totalEntries, "hasError", returnErr != nil, "siblingAbort", siblingAbort)
+	logger.V(logging.INFO).Info("Finished processing model", "numEntries", totalEntries, "hasError", returnErr != nil, "siblingAbort", reason == stopSiblingAbort)
 	return returnErr
 }
 
@@ -985,11 +1002,12 @@ func newErrorOutputLine(batchReqID, customID, code, message string) *outputLine 
 // for marshal/write failures.
 func writeResult(
 	out *outputLine,
-	sloCtx, userCancelCtx, progressCtx context.Context,
+	userCancelled bool,
+	progressCtx context.Context,
 	writers *outputWriters,
 	progress *executionProgress,
 ) error {
-	if sloCtx.Err() == nil && userCancelCtx.Err() != nil {
+	if userCancelled {
 		out.Response = nil
 		out.Error = &outputError{
 			Code:    string(batch_types.ErrCodeBatchCancelled),
@@ -1179,10 +1197,7 @@ type modelProcessor interface {
 		tenantID string,
 	) error
 	collect(
-		requestAbortCtx context.Context,
-		mainCtx context.Context,
-		sloCtx context.Context,
-		userCancelCtx context.Context,
+		ctx context.Context,
 		inputFile *os.File,
 		writers *outputWriters,
 		progress *executionProgress,
@@ -1190,10 +1205,10 @@ type modelProcessor interface {
 }
 
 type syncModelProcessor struct {
-	Processor
+	processor *Processor
 }
 
-func (p *syncModelProcessor) submit(
+func (s *syncModelProcessor) submit(
 	requestAbortCtx context.Context,
 	mainCtx context.Context,
 	sloCtx context.Context,
@@ -1205,6 +1220,7 @@ func (p *syncModelProcessor) submit(
 	passThroughHeaders map[string]string,
 	tenantID string,
 ) error {
+	p := s.processor
 	logger := logr.FromContextOrDiscard(requestAbortCtx).WithValues("model", modelID)
 	requestAbortCtx = logr.NewContext(requestAbortCtx, logger)
 
@@ -1313,7 +1329,7 @@ dispatch:
 				return
 			}
 
-			if err := writeResult(result, sloCtx, userCancelCtx, requestAbortCtx, writers, progress); err != nil {
+			if err := writeResult(result, sloCtx.Err() == nil && userCancelCtx.Err() != nil, requestAbortCtx, writers, progress); err != nil {
 				errOnce.Do(func() { modelErr = err })
 			}
 		}(entry)
@@ -1321,15 +1337,13 @@ dispatch:
 
 	wg.Wait()
 
-	return drainAndFinalize(requestAbortCtx, mainCtx, sloCtx, userCancelCtx,
-		inputFile, entries[dispatchedCount:], writers, progress, modelErr, logger, len(entries))
+	reason := resolveStopReason(sloCtx, userCancelCtx, mainCtx, requestAbortCtx, modelErr)
+	return drainAndFinalize(requestAbortCtx,
+		inputFile, entries[dispatchedCount:], writers, progress, modelErr, logger, len(entries), reason)
 }
 
 func (s *syncModelProcessor) collect(
-	requestAbortCtx context.Context,
-	mainCtx context.Context,
-	sloCtx context.Context,
-	userCancelCtx context.Context,
+	ctx context.Context,
 	inputFile *os.File,
 	writers *outputWriters,
 	progress *executionProgress,
@@ -1338,16 +1352,18 @@ func (s *syncModelProcessor) collect(
 }
 
 type asyncModelProcessor struct {
-	Processor
-	asyncClient inference.AsyncInferenceClient
-	pending     map[string]*pendingRequest
-	entries     []planEntry
-	submitCount int
-	modelID     string
-	logger      logr.Logger
+	processor      *Processor
+	asyncClient    inference.AsyncInferenceClient
+	pending        map[string]*pendingRequest
+	entries        []planEntry
+	submitCount    int
+	modelID        string
+	logger         logr.Logger
+	reason         stopReason
+	userCancelled  bool
 }
 
-func (p *asyncModelProcessor) submit(
+func (a *asyncModelProcessor) submit(
 	requestAbortCtx context.Context,
 	mainCtx context.Context,
 	sloCtx context.Context,
@@ -1359,6 +1375,8 @@ func (p *asyncModelProcessor) submit(
 	passThroughHeaders map[string]string,
 	tenantID string,
 ) error {
+	p := a.processor
+
 	logger := logr.FromContextOrDiscard(requestAbortCtx).WithValues("model", modelID)
 	requestAbortCtx = logr.NewContext(requestAbortCtx, logger)
 
@@ -1379,15 +1397,15 @@ func (p *asyncModelProcessor) submit(
 		return nil
 	}
 
-	p.asyncClient = asyncClient
-	p.entries = entries
-	p.modelID = modelID
-	p.logger = logger
-	p.pending = make(map[string]*pendingRequest)
+	a.asyncClient = asyncClient
+	a.entries = entries
+	a.modelID = modelID
+	a.logger = logger
+	a.pending = make(map[string]*pendingRequest)
 
 	for _, entry := range entries {
 		if requestAbortCtx.Err() != nil {
-			logger.V(logging.INFO).Info("Async submit aborted", "submitted", len(p.pending), "total", len(entries), "reason", requestAbortCtx.Err())
+			logger.V(logging.INFO).Info("Async submit aborted", "submitted", len(a.pending), "total", len(entries), "reason", requestAbortCtx.Err())
 			break
 		}
 
@@ -1405,7 +1423,7 @@ func (p *asyncModelProcessor) submit(
 				return fmt.Errorf("write parse error line: %w", err)
 			}
 			progress.record(requestAbortCtx, false)
-			p.submitCount++
+			a.submitCount++
 			continue
 		}
 
@@ -1435,26 +1453,25 @@ func (p *asyncModelProcessor) submit(
 				return fmt.Errorf("write submit error line: %w", err)
 			}
 			progress.record(requestAbortCtx, false)
-			p.submitCount++
+			a.submitCount++
 			continue
 		}
 
-		p.pending[batchReqID] = &pendingRequest{
+		a.pending[batchReqID] = &pendingRequest{
 			batchReqID: batchReqID,
 			customID:   req.CustomID,
 		}
-		p.submitCount++
+		a.submitCount++
 	}
 
-	logger.V(logging.INFO).Info("Submit phase complete", "submitted", len(p.pending), "total", p.submitCount)
+	logger.V(logging.INFO).Info("Submit phase complete", "submitted", len(a.pending), "total", a.submitCount)
+	a.reason = resolveStopReason(sloCtx, userCancelCtx, mainCtx, requestAbortCtx, nil)
+	a.userCancelled = sloCtx.Err() == nil && userCancelCtx.Err() != nil
 	return nil
 }
 
 func (a *asyncModelProcessor) collect(
-	requestAbortCtx context.Context,
-	mainCtx context.Context,
-	sloCtx context.Context,
-	userCancelCtx context.Context,
+	ctx context.Context,
 	inputFile *os.File,
 	writers *outputWriters,
 	progress *executionProgress,
@@ -1471,9 +1488,9 @@ func (a *asyncModelProcessor) collect(
 	var modelErr error
 
 	for len(a.pending) > 0 {
-		resp, err := a.asyncClient.GetResult(requestAbortCtx)
+		resp, err := a.asyncClient.GetResult(ctx)
 		if err != nil {
-			if requestAbortCtx.Err() == nil {
+			if ctx.Err() == nil {
 				a.logger.Error(err, "Failed to collect async result", "pendingCount", len(a.pending))
 				modelErr = fmt.Errorf("async result collection failed: %w", err)
 			}
@@ -1487,7 +1504,7 @@ func (a *asyncModelProcessor) collect(
 		}
 
 		out := buildOutputLine(pr.batchReqID, pr.customID, a.modelID, resp.RequestID, resp, nil, a.logger)
-		if err := writeResult(out, sloCtx, userCancelCtx, requestAbortCtx, writers, progress); err != nil {
+		if err := writeResult(out, a.userCancelled, ctx, writers, progress); err != nil {
 			modelErr = err
 			break
 		}
@@ -1505,9 +1522,13 @@ func (a *asyncModelProcessor) collect(
 		if err := writers.write(lineBytes, true); err != nil {
 			return fmt.Errorf("write uncollected error line: %w", err)
 		}
-		progress.record(requestAbortCtx, false)
+		progress.record(ctx, false)
 	}
 
-	return drainAndFinalize(requestAbortCtx, mainCtx, sloCtx, userCancelCtx,
-		inputFile, a.entries[a.submitCount:], writers, progress, modelErr, a.logger, len(a.entries))
+	reason := a.reason
+	if modelErr != nil {
+		reason = stopFailed
+	}
+	return drainAndFinalize(ctx,
+		inputFile, a.entries[a.submitCount:], writers, progress, modelErr, a.logger, len(a.entries), reason)
 }
