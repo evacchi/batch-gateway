@@ -293,6 +293,17 @@ func (p *Processor) executeJob(ctx, sloCtx, userCancelCtx, requestAbortCtx conte
 				passThroughHeaders,
 				tenantID,
 			)
+			if err == nil {
+				err = mp.collect(
+					requestAbortCtx,
+					ctx,
+					sloCtx,
+					userCancelCtx,
+					inputFile,
+					writers,
+					progress,
+				)
+			}
 
 			// Abort all sibling models when any model hits a fatal I/O error
 			// (e.g. output file write failure). modelErr is only set for local
@@ -985,9 +996,9 @@ func writeResult(
 			Message: "This request was cancelled while in progress.",
 		}
 		progress.record(progressCtx, false)
+	} else {
+		progress.record(progressCtx, out.isSuccess())
 	}
-
-	progress.record(progressCtx, out.isSuccess())
 
 	lineBytes, err := json.Marshal(out)
 	if err != nil {
@@ -1149,6 +1160,11 @@ func newBatchRequestID(requestID string) string {
 	return fmt.Sprintf("batch_req_%s", requestID)
 }
 
+type pendingRequest struct {
+	batchReqID string
+	customID   string
+}
+
 type modelProcessor interface {
 	submit(
 		requestAbortCtx context.Context,
@@ -1162,7 +1178,15 @@ type modelProcessor interface {
 		passThroughHeaders map[string]string,
 		tenantID string,
 	) error
-	collect()
+	collect(
+		requestAbortCtx context.Context,
+		mainCtx context.Context,
+		sloCtx context.Context,
+		userCancelCtx context.Context,
+		inputFile *os.File,
+		writers *outputWriters,
+		progress *executionProgress,
+	) error
 }
 
 type syncModelProcessor struct {
@@ -1302,12 +1326,26 @@ dispatch:
 		inputFile, entries[dispatchedCount:], writers, progress, modelErr, logger, len(entries))
 }
 
-func (s *syncModelProcessor) collect() {
-
+func (s *syncModelProcessor) collect(
+	requestAbortCtx context.Context,
+	mainCtx context.Context,
+	sloCtx context.Context,
+	userCancelCtx context.Context,
+	inputFile *os.File,
+	writers *outputWriters,
+	progress *executionProgress,
+) error {
+	return nil
 }
 
 type asyncModelProcessor struct {
-	processor *Processor
+	processor   *Processor
+	asyncClient inference.AsyncInferenceClient
+	pending     map[string]*pendingRequest
+	entries     []planEntry
+	submitCount int
+	modelID     string
+	logger      logr.Logger
 }
 
 func (a *asyncModelProcessor) submit(
@@ -1320,8 +1358,8 @@ func (a *asyncModelProcessor) submit(
 	writers *outputWriters,
 	progress *executionProgress,
 	passThroughHeaders map[string]string,
-	tenantID string) error {
-
+	tenantID string,
+) error {
 	p := a.processor
 
 	logger := logr.FromContextOrDiscard(requestAbortCtx).WithValues("model", modelID)
@@ -1343,24 +1381,16 @@ func (a *asyncModelProcessor) submit(
 			inference.ErrCodeModelNotFound)
 		return nil
 	}
-	defer func() {
-		if err := asyncClient.Close(); err != nil {
-			logger.Error(err, "Failed to close async client")
-		}
-	}()
 
-	// ── Phase 1: Submit ────────────────────────────────────────────────────
-	type pendingRequest struct {
-		batchReqID string
-		customID   string
-	}
-
-	pending := make(map[string]*pendingRequest)
-	var submitCount int
+	a.asyncClient = asyncClient
+	a.entries = entries
+	a.modelID = modelID
+	a.logger = logger
+	a.pending = make(map[string]*pendingRequest)
 
 	for _, entry := range entries {
 		if requestAbortCtx.Err() != nil {
-			logger.V(logging.INFO).Info("Async submit aborted", "submitted", len(pending), "total", len(entries), "reason", requestAbortCtx.Err())
+			logger.V(logging.INFO).Info("Async submit aborted", "submitted", len(a.pending), "total", len(entries), "reason", requestAbortCtx.Err())
 			break
 		}
 
@@ -1378,7 +1408,7 @@ func (a *asyncModelProcessor) submit(
 				return fmt.Errorf("write parse error line: %w", err)
 			}
 			progress.record(requestAbortCtx, false)
-			submitCount++
+			a.submitCount++
 			continue
 		}
 
@@ -1408,49 +1438,66 @@ func (a *asyncModelProcessor) submit(
 				return fmt.Errorf("write submit error line: %w", err)
 			}
 			progress.record(requestAbortCtx, false)
-			submitCount++
+			a.submitCount++
 			continue
 		}
 
-		pending[batchReqID] = &pendingRequest{
+		a.pending[batchReqID] = &pendingRequest{
 			batchReqID: batchReqID,
 			customID:   req.CustomID,
 		}
-		submitCount++
+		a.submitCount++
 	}
 
-	logger.V(logging.INFO).Info("Submit phase complete", "submitted", len(pending), "total", submitCount)
+	logger.V(logging.INFO).Info("Submit phase complete", "submitted", len(a.pending), "total", a.submitCount)
+	return nil
+}
 
-	// ── Phase 2: Collect ───────────────────────────────────────────────────
+func (a *asyncModelProcessor) collect(
+	requestAbortCtx context.Context,
+	mainCtx context.Context,
+	sloCtx context.Context,
+	userCancelCtx context.Context,
+	inputFile *os.File,
+	writers *outputWriters,
+	progress *executionProgress,
+) error {
+	if a.asyncClient == nil {
+		return nil
+	}
+	defer func() {
+		if err := a.asyncClient.Close(); err != nil {
+			a.logger.Error(err, "Failed to close async client")
+		}
+	}()
+
 	var modelErr error
 
-	for len(pending) > 0 {
-		resp, err := asyncClient.GetResult(requestAbortCtx)
+	for len(a.pending) > 0 {
+		resp, err := a.asyncClient.GetResult(requestAbortCtx)
 		if err != nil {
 			if requestAbortCtx.Err() == nil {
-				logger.Error(err, "Failed to collect async result", "pendingCount", len(pending))
+				a.logger.Error(err, "Failed to collect async result", "pendingCount", len(a.pending))
 				modelErr = fmt.Errorf("async result collection failed: %w", err)
 			}
 			break
 		}
 
-		pr, ok := pending[resp.RequestID]
+		pr, ok := a.pending[resp.RequestID]
 		if !ok {
-			logger.V(logging.TRACE).Info("Ignoring result for unknown request", "requestID", resp.RequestID)
+			a.logger.V(logging.TRACE).Info("Ignoring result for unknown request", "requestID", resp.RequestID)
 			continue
 		}
 
-		out := buildOutputLine(pr.batchReqID, pr.customID, modelID, resp.RequestID, resp, nil, logger)
+		out := buildOutputLine(pr.batchReqID, pr.customID, a.modelID, resp.RequestID, resp, nil, a.logger)
 		if err := writeResult(out, sloCtx, userCancelCtx, requestAbortCtx, writers, progress); err != nil {
 			modelErr = err
 			break
 		}
-		delete(pending, resp.RequestID)
+		delete(a.pending, resp.RequestID)
 	}
 
-	// Drain submitted-but-uncollected requests as errors so that
-	// output_lines + error_lines == total_requests.
-	for _, pr := range pending {
+	for _, pr := range a.pending {
 		out := newErrorOutputLine(pr.batchReqID, pr.customID,
 			string(batch_types.ErrCodeBatchExpired), "result not collected before deadline")
 		lineBytes, err := json.Marshal(out)
@@ -1465,9 +1512,5 @@ func (a *asyncModelProcessor) submit(
 	}
 
 	return drainAndFinalize(requestAbortCtx, mainCtx, sloCtx, userCancelCtx,
-		inputFile, entries[submitCount:], writers, progress, modelErr, logger, len(entries))
-}
-
-func (a *asyncModelProcessor) collect() {
-
+		inputFile, a.entries[a.submitCount:], writers, progress, modelErr, a.logger, len(a.entries))
 }
