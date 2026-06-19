@@ -334,6 +334,7 @@ func (p *Processor) executeJob(ctx, sloCtx, userCancelCtx, requestAbortCtx conte
 				passThroughHeaders,
 				tenantID,
 			)
+			// send to collector channel for async processing
 			p.collector.send(mp.(modelResultCollector))
 		}(mp, safeModelID, modelID)
 	}
