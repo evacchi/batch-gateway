@@ -1190,10 +1190,10 @@ type modelProcessor interface {
 }
 
 type syncModelProcessor struct {
-	processor *Processor
+	Processor
 }
 
-func (s *syncModelProcessor) submit(
+func (p *syncModelProcessor) submit(
 	requestAbortCtx context.Context,
 	mainCtx context.Context,
 	sloCtx context.Context,
@@ -1205,7 +1205,6 @@ func (s *syncModelProcessor) submit(
 	passThroughHeaders map[string]string,
 	tenantID string,
 ) error {
-	p := s.processor
 	logger := logr.FromContextOrDiscard(requestAbortCtx).WithValues("model", modelID)
 	requestAbortCtx = logr.NewContext(requestAbortCtx, logger)
 
@@ -1339,7 +1338,7 @@ func (s *syncModelProcessor) collect(
 }
 
 type asyncModelProcessor struct {
-	processor   *Processor
+	Processor
 	asyncClient inference.AsyncInferenceClient
 	pending     map[string]*pendingRequest
 	entries     []planEntry
@@ -1348,7 +1347,7 @@ type asyncModelProcessor struct {
 	logger      logr.Logger
 }
 
-func (a *asyncModelProcessor) submit(
+func (p *asyncModelProcessor) submit(
 	requestAbortCtx context.Context,
 	mainCtx context.Context,
 	sloCtx context.Context,
@@ -1360,8 +1359,6 @@ func (a *asyncModelProcessor) submit(
 	passThroughHeaders map[string]string,
 	tenantID string,
 ) error {
-	p := a.processor
-
 	logger := logr.FromContextOrDiscard(requestAbortCtx).WithValues("model", modelID)
 	requestAbortCtx = logr.NewContext(requestAbortCtx, logger)
 
@@ -1382,15 +1379,15 @@ func (a *asyncModelProcessor) submit(
 		return nil
 	}
 
-	a.asyncClient = asyncClient
-	a.entries = entries
-	a.modelID = modelID
-	a.logger = logger
-	a.pending = make(map[string]*pendingRequest)
+	p.asyncClient = asyncClient
+	p.entries = entries
+	p.modelID = modelID
+	p.logger = logger
+	p.pending = make(map[string]*pendingRequest)
 
 	for _, entry := range entries {
 		if requestAbortCtx.Err() != nil {
-			logger.V(logging.INFO).Info("Async submit aborted", "submitted", len(a.pending), "total", len(entries), "reason", requestAbortCtx.Err())
+			logger.V(logging.INFO).Info("Async submit aborted", "submitted", len(p.pending), "total", len(entries), "reason", requestAbortCtx.Err())
 			break
 		}
 
@@ -1408,7 +1405,7 @@ func (a *asyncModelProcessor) submit(
 				return fmt.Errorf("write parse error line: %w", err)
 			}
 			progress.record(requestAbortCtx, false)
-			a.submitCount++
+			p.submitCount++
 			continue
 		}
 
@@ -1438,18 +1435,18 @@ func (a *asyncModelProcessor) submit(
 				return fmt.Errorf("write submit error line: %w", err)
 			}
 			progress.record(requestAbortCtx, false)
-			a.submitCount++
+			p.submitCount++
 			continue
 		}
 
-		a.pending[batchReqID] = &pendingRequest{
+		p.pending[batchReqID] = &pendingRequest{
 			batchReqID: batchReqID,
 			customID:   req.CustomID,
 		}
-		a.submitCount++
+		p.submitCount++
 	}
 
-	logger.V(logging.INFO).Info("Submit phase complete", "submitted", len(a.pending), "total", a.submitCount)
+	logger.V(logging.INFO).Info("Submit phase complete", "submitted", len(p.pending), "total", p.submitCount)
 	return nil
 }
 
