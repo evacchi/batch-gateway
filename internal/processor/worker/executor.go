@@ -299,7 +299,7 @@ func (p *Processor) executeJob(ctx, sloCtx, userCancelCtx, requestAbortCtx conte
 
 	processors := make([]modelProcessor, 0, len(modelMap.SafeToModel))
 	for safeModelID, modelID := range modelMap.SafeToModel {
-		mp := p.makeModelProcessor()
+		mp := p.makeModelProcessor(pw, inputFile)
 		processors = append(processors, mp)
 
 		go func(mp modelProcessor, safeModelID, modelID string) {
@@ -308,17 +308,11 @@ func (p *Processor) executeJob(ctx, sloCtx, userCancelCtx, requestAbortCtx conte
 				ctx,
 				sloCtx,
 				userCancelCtx,
-				inputFile,
 				plansDir, safeModelID, modelID,
-				pw,
 				passThroughHeaders,
 				tenantID,
 			)
-			mp.collect(
-				requestAbortCtx,
-				inputFile,
-				pw,
-			)
+			mp.collect(requestAbortCtx)
 		}(mp, safeModelID, modelID)
 	}
 
@@ -371,11 +365,11 @@ func (p *Processor) executeJob(ctx, sloCtx, userCancelCtx, requestAbortCtx conte
 	return counts, nil
 }
 
-func (p *Processor) makeModelProcessor() modelProcessor {
+func (p *Processor) makeModelProcessor(pw *progressWorker, inputFile *os.File) modelProcessor {
 	if p.asyncInference == nil {
-		return &syncModelProcessor{processor: p, errCh: make(chan error, 1)}
+		return &syncModelProcessor{processor: p, pw: pw, inputFile: inputFile, errCh: make(chan error, 1)}
 	}
-	return &asyncModelProcessor{processor: p, errCh: make(chan error, 1)}
+	return &asyncModelProcessor{processor: p, pw: pw, inputFile: inputFile, errCh: make(chan error, 1)}
 }
 
 // drainAndFinalize drains undispatched entries based on the stop reason and
@@ -871,24 +865,19 @@ type modelProcessor interface {
 		mainCtx context.Context,
 		sloCtx context.Context,
 		userCancelCtx context.Context,
-		inputFile *os.File,
 		plansDir, safeModelID, modelID string,
-		pw *progressWorker,
 		passThroughHeaders map[string]string,
 		tenantID string,
 	) error
-	collect(
-		ctx context.Context,
-		inputFile *os.File,
-		pw *progressWorker,
-	) error
+	collect(ctx context.Context) error
 	done() chan error
 }
 
 type syncModelProcessor struct {
 	processor *Processor
+	pw        *progressWorker
+	inputFile *os.File
 	errCh     chan error
-	submitErr error
 }
 
 func (s *syncModelProcessor) done() chan error { return s.errCh }
@@ -898,9 +887,7 @@ func (s *syncModelProcessor) submit(
 	mainCtx context.Context,
 	sloCtx context.Context,
 	userCancelCtx context.Context,
-	inputFile *os.File,
 	plansDir, safeModelID, modelID string,
-	pw *progressWorker,
 	passThroughHeaders map[string]string,
 	tenantID string,
 ) error {
@@ -920,7 +907,7 @@ func (s *syncModelProcessor) submit(
 	epLimit := p.endpointLimits[client]
 	if epLimit == nil {
 		logger.V(logging.INFO).Info("No endpoint limit for model (client not in resolver), draining as model_not_found")
-		drainUnprocessedRequests(inputFile, entries, pw,
+		drainUnprocessedRequests(s.inputFile, entries, s.pw,
 			batch_types.BatchErrorCode(inference.ErrCodeModelNotFound))
 		return nil
 	}
@@ -955,7 +942,7 @@ dispatch:
 			defer endpointSem.Release()
 			defer p.globalSem.Release()
 
-			result, execErr := p.executeOneRequest(requestAbortCtx, sloCtx, inputFile, entry, modelID, passThroughHeaders, tenantID)
+			result, execErr := p.executeOneRequest(requestAbortCtx, sloCtx, s.inputFile, entry, modelID, passThroughHeaders, tenantID)
 
 			if epLimit.aimd != nil && execErr == nil && result != nil && result.Response != nil {
 				sc := result.Response.StatusCode
@@ -984,28 +971,26 @@ dispatch:
 				return
 			}
 
-			pw.send(resultItem{out: result, userCancelled: sloCtx.Err() == nil && userCancelCtx.Err() != nil})
+			s.pw.send(resultItem{out: result, userCancelled: sloCtx.Err() == nil && userCancelCtx.Err() != nil})
 		}(entry)
 	}
 
 	wg.Wait()
 
 	reason := resolveStopReason(sloCtx, userCancelCtx, mainCtx, requestAbortCtx, modelErr)
-	s.submitErr = drainAndFinalize(inputFile, entries[dispatchedCount:], pw, modelErr, logger, len(entries), reason)
-	return s.submitErr
+	finalErr := drainAndFinalize(s.inputFile, entries[dispatchedCount:], s.pw, modelErr, logger, len(entries), reason)
+	s.errCh <- finalErr
+	return finalErr
 }
 
-func (s *syncModelProcessor) collect(
-	ctx context.Context,
-	inputFile *os.File,
-	pw *progressWorker,
-) error {
-	s.errCh <- s.submitErr
-	return s.submitErr
+func (s *syncModelProcessor) collect(ctx context.Context) error {
+	return nil
 }
 
 type asyncModelProcessor struct {
 	processor   *Processor
+	pw          *progressWorker
+	inputFile   *os.File
 	errCh       chan error
 	submitErr   error
 	asyncClient inference.AsyncInferenceClient
@@ -1024,9 +1009,7 @@ func (a *asyncModelProcessor) submit(
 	mainCtx context.Context,
 	sloCtx context.Context,
 	userCancelCtx context.Context,
-	inputFile *os.File,
 	plansDir, safeModelID, modelID string,
-	pw *progressWorker,
 	passThroughHeaders map[string]string,
 	tenantID string,
 ) (submitErr error) {
@@ -1048,7 +1031,7 @@ func (a *asyncModelProcessor) submit(
 	asyncClient := p.asyncInference.ClientFor(modelID)
 	if asyncClient == nil {
 		logger.V(logging.INFO).Info("No async client for model, draining as model_not_found")
-		drainUnprocessedRequests(inputFile, entries, pw, inference.ErrCodeModelNotFound)
+		drainUnprocessedRequests(a.inputFile, entries, a.pw, inference.ErrCodeModelNotFound)
 		return nil
 	}
 
@@ -1064,12 +1047,12 @@ func (a *asyncModelProcessor) submit(
 			break
 		}
 
-		req, batchReqID, parseErr, readErr := readRequestLine(inputFile, entry, logger)
+		req, batchReqID, parseErr, readErr := readRequestLine(a.inputFile, entry, logger)
 		if readErr != nil {
 			return readErr
 		}
 		if parseErr != nil {
-			pw.send(resultItem{out: parseErr})
+			a.pw.send(resultItem{out: parseErr})
 			a.submitCount++
 			continue
 		}
@@ -1091,7 +1074,7 @@ func (a *asyncModelProcessor) submit(
 		if submitErr := asyncClient.Submit(requestAbortCtx, inferReq); submitErr != nil {
 			out := newErrorOutputLine(batchReqID, req.CustomID,
 				string(submitErr.Category), submitErr.Message)
-			pw.send(resultItem{out: out})
+			a.pw.send(resultItem{out: out})
 			a.submitCount++
 			continue
 		}
@@ -1108,11 +1091,7 @@ func (a *asyncModelProcessor) submit(
 	return nil
 }
 
-func (a *asyncModelProcessor) collect(
-	ctx context.Context,
-	inputFile *os.File,
-	pw *progressWorker,
-) error {
+func (a *asyncModelProcessor) collect(ctx context.Context) error {
 	if a.submitErr != nil {
 		a.errCh <- a.submitErr
 		return a.submitErr
@@ -1146,21 +1125,21 @@ func (a *asyncModelProcessor) collect(
 		}
 
 		out := buildOutputLine(pr.batchReqID, pr.customID, a.modelID, resp.RequestID, resp, nil, a.logger)
-		pw.send(resultItem{out: out, userCancelled: a.reason == stopCancelled})
+		a.pw.send(resultItem{out: out, userCancelled: a.reason == stopCancelled})
 		delete(a.pending, resp.RequestID)
 	}
 
 	for _, pr := range a.pending {
 		out := newErrorOutputLine(pr.batchReqID, pr.customID,
 			string(batch_types.ErrCodeBatchExpired), "result not collected before deadline")
-		pw.send(resultItem{out: out})
+		a.pw.send(resultItem{out: out})
 	}
 
 	reason := a.reason
 	if modelErr != nil {
 		reason = stopFailed
 	}
-	collectErr := drainAndFinalize(inputFile, a.entries[a.submitCount:], pw, modelErr, a.logger, len(a.entries), reason)
+	collectErr := drainAndFinalize(a.inputFile, a.entries[a.submitCount:], a.pw, modelErr, a.logger, len(a.entries), reason)
 	a.errCh <- collectErr
 	return collectErr
 }

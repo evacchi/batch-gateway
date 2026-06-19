@@ -49,12 +49,14 @@ func (p *Processor) processModel(
 	pw := newProgressWorker(requestAbortCtx, writers, progress)
 	go pw.run()
 
-	mp := &syncModelProcessor{processor: p}
-	err := mp.submit(requestAbortCtx, mainCtx, sloCtx, userCancelCtx, inputFile, plansDir, safeModelID, modelID, pw, passThroughHeaders, tenantID)
+	mp := &syncModelProcessor{processor: p, pw: pw, inputFile: inputFile, errCh: make(chan error, 1)}
+	mp.submit(requestAbortCtx, mainCtx, sloCtx, userCancelCtx, plansDir, safeModelID, modelID, passThroughHeaders, tenantID)
+	mp.collect(requestAbortCtx)
 
 	pw.close()
 	pwErr := <-pw.errCh
 
+	err := <-mp.errCh
 	if err == nil {
 		err = pwErr
 	}
