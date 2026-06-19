@@ -776,6 +776,9 @@ func drainAndFinalize(
 			drainUnprocessedRequests(ctx, inputFile, undispatched, writers, progress,
 				batch_types.ErrCodeBatchFailed)
 		}
+
+	case stopNone:
+		// All entries dispatched and processed successfully — nothing to drain.
 	}
 
 	logger.V(logging.INFO).Info("Finished processing model", "numEntries", totalEntries, "hasError", returnErr != nil, "siblingAbort", reason == stopSiblingAbort)
