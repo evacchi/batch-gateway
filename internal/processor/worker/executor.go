@@ -429,7 +429,7 @@ func (p *Processor) processModel(
 	epLimit := p.endpointLimits[client]
 	if epLimit == nil {
 		logger.V(logging.INFO).Info("No endpoint limit for model (client not in resolver), draining as model_not_found")
-		p.drainUnprocessedRequests(requestAbortCtx, inputFile, entries, writers, progress,
+		drainUnprocessedRequests(requestAbortCtx, inputFile, entries, writers, progress,
 			batch_types.BatchErrorCode(inference.ErrCodeModelNotFound))
 		return nil
 	}
@@ -525,7 +525,7 @@ dispatch:
 
 	wg.Wait()
 
-	return p.drainAndFinalize(requestAbortCtx, mainCtx, sloCtx, userCancelCtx,
+	return drainAndFinalize(requestAbortCtx, mainCtx, sloCtx, userCancelCtx,
 		inputFile, entries[dispatchedCount:], writers, progress, modelErr, logger, len(entries))
 }
 
@@ -558,7 +558,7 @@ func (p *Processor) processModelAsync(
 	asyncClient := p.asyncInference.ClientFor(modelID)
 	if asyncClient == nil {
 		logger.V(logging.INFO).Info("No async client for model, draining as model_not_found")
-		p.drainUnprocessedRequests(
+		drainUnprocessedRequests(
 			requestAbortCtx, inputFile, entries, writers, progress,
 			inference.ErrCodeModelNotFound)
 		return nil
@@ -682,13 +682,13 @@ func (p *Processor) processModelAsync(
 		progress.record(requestAbortCtx, false)
 	}
 
-	return p.drainAndFinalize(requestAbortCtx, mainCtx, sloCtx, userCancelCtx,
+	return drainAndFinalize(requestAbortCtx, mainCtx, sloCtx, userCancelCtx,
 		inputFile, entries[submitCount:], writers, progress, modelErr, logger, len(entries))
 }
 
 // drainAndFinalize drains undispatched entries based on termination reason and
 // returns the appropriate sentinel error. Shared by processModel and processModelAsync.
-func (p *Processor) drainAndFinalize(
+func drainAndFinalize(
 	requestAbortCtx context.Context,
 	mainCtx context.Context,
 	sloCtx context.Context,
@@ -707,7 +707,7 @@ func (p *Processor) drainAndFinalize(
 		// SLO deadline fired during dispatch — record remaining requests as expired.
 		if len(undispatched) > 0 {
 			logger.V(logging.INFO).Info("SLO expired: draining undispatched entries", "count", len(undispatched))
-			p.drainUnprocessedRequests(requestAbortCtx, inputFile, undispatched, writers, progress,
+			drainUnprocessedRequests(requestAbortCtx, inputFile, undispatched, writers, progress,
 				batch_types.ErrCodeBatchExpired)
 		}
 		returnErr = errExpired
@@ -716,7 +716,7 @@ func (p *Processor) drainAndFinalize(
 		// User-initiated cancel — record remaining requests as cancelled.
 		if len(undispatched) > 0 {
 			logger.V(logging.INFO).Info("Cancelled: draining undispatched entries", "count", len(undispatched))
-			p.drainUnprocessedRequests(requestAbortCtx, inputFile, undispatched, writers, progress,
+			drainUnprocessedRequests(requestAbortCtx, inputFile, undispatched, writers, progress,
 				batch_types.ErrCodeBatchCancelled)
 		}
 		returnErr = errCancelled
@@ -725,7 +725,7 @@ func (p *Processor) drainAndFinalize(
 		// System error in a model goroutine — record remaining requests as failed.
 		if len(undispatched) > 0 {
 			logger.V(logging.INFO).Info("Fatal error: draining undispatched entries", "count", len(undispatched))
-			p.drainUnprocessedRequests(requestAbortCtx, inputFile, undispatched, writers, progress,
+			drainUnprocessedRequests(requestAbortCtx, inputFile, undispatched, writers, progress,
 				batch_types.ErrCodeBatchFailed)
 		}
 		returnErr = modelErr
@@ -742,7 +742,7 @@ func (p *Processor) drainAndFinalize(
 			// Drain undispatched entries as batch_failed so that
 			// completed + failed == total holds for the job.
 			logger.V(logging.INFO).Info("Sibling abort: draining undispatched entries", "count", len(undispatched))
-			p.drainUnprocessedRequests(requestAbortCtx, inputFile, undispatched, writers, progress,
+			drainUnprocessedRequests(requestAbortCtx, inputFile, undispatched, writers, progress,
 				batch_types.ErrCodeBatchFailed)
 		}
 	}
@@ -756,7 +756,7 @@ func (p *Processor) drainAndFinalize(
 // mid-execution (SLO expiry, cancellation, or systemic failure). For each plan entry, it reads
 // the original request from input.jsonl to extract the custom_id, then writes an error line with
 // the given error code and its canonical message.
-func (p *Processor) drainUnprocessedRequests(
+func drainUnprocessedRequests(
 	ctx context.Context,
 	inputFile *os.File,
 	entries []planEntry,
@@ -1167,7 +1167,7 @@ type syncModelProcessor struct {
 	processor *Processor
 }
 
-func (p *syncModelProcessor) submit(
+func (s *syncModelProcessor) submit(
 	requestAbortCtx context.Context,
 	mainCtx context.Context,
 	sloCtx context.Context,
@@ -1177,21 +1177,130 @@ func (p *syncModelProcessor) submit(
 	writers *outputWriters,
 	progress *executionProgress,
 	passThroughHeaders map[string]string,
-	tenantID string) error {
-	return p.processor.processModel(
-		requestAbortCtx,
-		mainCtx,
-		sloCtx,
-		userCancelCtx,
-		inputFile,
-		plansDir, safeModelID, modelID,
-		writers,
-		progress,
-		passThroughHeaders,
-		tenantID)
+	tenantID string,
+) error {
+	p := s.processor
+	logger := logr.FromContextOrDiscard(requestAbortCtx).WithValues("model", modelID)
+	requestAbortCtx = logr.NewContext(requestAbortCtx, logger)
+
+	planPath := filepath.Join(plansDir, safeModelID+".plan")
+	entries, err := readPlanEntries(planPath)
+	if err != nil {
+		return fmt.Errorf("model setup failed: read plan for model %s: %w", modelID, err)
+	}
+
+	logger.V(logging.INFO).Info("Processing requests for a model", "numEntries", len(entries))
+
+	// Resolve the per-endpoint adaptive semaphore and AIMD controller for this
+	// model. Models sharing the same inference endpoint share the same pair.
+	// ClientFor can return nil after gateway config changes between ingestion and
+	// execution, or during recovery when model_map/plan files predate the current
+	// resolver. In that case, drain all entries as model_not_found.
+	client := p.inference.ClientFor(modelID)
+	epLimit := p.endpointLimits[client]
+	if epLimit == nil {
+		logger.V(logging.INFO).Info("No endpoint limit for model (client not in resolver), draining as model_not_found")
+		drainUnprocessedRequests(requestAbortCtx, inputFile, entries, writers, progress,
+			batch_types.BatchErrorCode(inference.ErrCodeModelNotFound))
+		return nil
+	}
+	endpointSem := epLimit.sem
+
+	var (
+		wg              sync.WaitGroup
+		errOnce         sync.Once
+		modelErr        error
+		dispatchedCount int
+	)
+
+dispatch:
+	for i, entry := range entries {
+		if requestAbortCtx.Err() != nil {
+			// Context cancelled (SLO expiry, SIGTERM, or user cancel via requestAbortFn).
+			// Do not set modelErr here; the drain switch determines the correct sentinel
+			// by inspecting sloCtx, userCancelCtx, and requestAbortCtx independently.
+			break
+		}
+
+		// Acquire semaphores in order: endpoint-local before global (shared).
+		// This order prevents starving other endpoints — blocking on global only wastes a local slot.
+		if err := endpointSem.Acquire(requestAbortCtx); err != nil {
+			break dispatch
+		}
+
+		if err := p.globalSem.Acquire(requestAbortCtx); err != nil {
+			endpointSem.Release()
+			break dispatch
+		}
+
+		dispatchedCount = i + 1
+		wg.Add(1)
+		go func(entry planEntry) {
+			defer wg.Done()
+			defer endpointSem.Release()
+			defer p.globalSem.Release()
+
+			result, execErr := p.executeOneRequest(requestAbortCtx, sloCtx, inputFile, entry, modelID, passThroughHeaders, tenantID)
+
+			// AIMD signal: adjust concurrency based on inference endpoint capacity.
+			//
+			// Signal semantics:
+			//   429          → RecordRateLimit (sustained overload after all retries)
+			//   5xx          → RecordRateLimit (server overload / unhealthy)
+			//   200 with capacity retries → RecordRateLimit (retry absorbed 429/5xx)
+			//   200 with network-only retries → RecordSuccess (no capacity signal)
+			//   200 clean    → RecordSuccess (genuine available capacity)
+			//   4xx (not 429) → RecordSuccess (gateway had capacity, request was malformed)
+			//   non-HTTP err → skip (no capacity signal — network, timeout, etc.)
+			//   fatal execErr → skip (local I/O, not related to gateway capacity)
+			//
+			// AIMD only affects future dispatch. It does not abort in-flight
+			// requests — those continue until completion or context cancellation.
+			if epLimit.aimd != nil && execErr == nil && result != nil && result.Response != nil {
+				sc := result.Response.StatusCode
+				switch {
+				case sc == http.StatusTooManyRequests:
+					epLimit.aimd.RecordRateLimit(metrics.AIMDSignal429)
+					metrics.RecordAIMDDecrease(epLimit.label, metrics.AIMDSignal429)
+				case sc >= http.StatusInternalServerError:
+					epLimit.aimd.RecordRateLimit(metrics.AIMDSignal5xx)
+					metrics.RecordAIMDDecrease(epLimit.label, metrics.AIMDSignal5xx)
+				case result.hadCapacityRetry:
+					epLimit.aimd.RecordRateLimit(metrics.AIMDSignalCapacityRetry)
+					metrics.RecordAIMDDecrease(epLimit.label, metrics.AIMDSignalCapacityRetry)
+				default:
+					oldLimit := epLimit.aimd.Limit()
+					epLimit.aimd.RecordSuccess()
+					if epLimit.aimd.Limit() != oldLimit {
+						metrics.RecordAIMDIncrease(epLimit.label)
+					}
+				}
+				metrics.SetAIMDConcurrencyLimit(epLimit.label, float64(epLimit.aimd.Limit()))
+			}
+			if execErr != nil {
+				// Fatal read failure: the input file is unreadable at this offset
+				// (e.g. disk corruption). We do not know the CustomID, so we cannot
+				// write a batch_failed entry to the error file. This means
+				// completed + failed < total for this job, but the job status is
+				// set to failed, which already signals that output files are incomplete.
+				logger.Error(execErr, "Fatal error executing request", "offset", entry.Offset)
+				errOnce.Do(func() { modelErr = execErr })
+				return
+			}
+
+			if err := writeResult(result, sloCtx, userCancelCtx, requestAbortCtx, writers, progress); err != nil {
+				errOnce.Do(func() { modelErr = err })
+			}
+		}(entry)
+	}
+
+	wg.Wait()
+
+	return drainAndFinalize(requestAbortCtx, mainCtx, sloCtx, userCancelCtx,
+		inputFile, entries[dispatchedCount:], writers, progress, modelErr, logger, len(entries))
 }
 
-func (p *syncModelProcessor) collect() {
+func (s *syncModelProcessor) collect() {
 
 }
 
@@ -1199,7 +1308,7 @@ type asyncModelProcessor struct {
 	processor *Processor
 }
 
-func (p *asyncModelProcessor) submit(
+func (a *asyncModelProcessor) submit(
 	requestAbortCtx context.Context,
 	mainCtx context.Context,
 	sloCtx context.Context,
@@ -1210,19 +1319,151 @@ func (p *asyncModelProcessor) submit(
 	progress *executionProgress,
 	passThroughHeaders map[string]string,
 	tenantID string) error {
-	return p.processor.processModelAsync(
-		requestAbortCtx,
-		mainCtx,
-		sloCtx,
-		userCancelCtx,
-		inputFile,
-		plansDir, safeModelID, modelID,
-		writers,
-		progress,
-		passThroughHeaders,
-		tenantID)
+
+	p := a.processor
+
+	logger := logr.FromContextOrDiscard(requestAbortCtx).WithValues("model", modelID)
+	requestAbortCtx = logr.NewContext(requestAbortCtx, logger)
+
+	planPath := filepath.Join(plansDir, safeModelID+".plan")
+	entries, err := readPlanEntries(planPath)
+	if err != nil {
+		return fmt.Errorf("model setup failed: read plan for model %s: %w", modelID, err)
+	}
+
+	logger.V(logging.INFO).Info("Processing requests for model (async)", "numEntries", len(entries))
+
+	asyncClient := p.asyncInference.ClientFor(modelID)
+	if asyncClient == nil {
+		logger.V(logging.INFO).Info("No async client for model, draining as model_not_found")
+		drainUnprocessedRequests(
+			requestAbortCtx, inputFile, entries, writers, progress,
+			inference.ErrCodeModelNotFound)
+		return nil
+	}
+	defer func() {
+		if err := asyncClient.Close(); err != nil {
+			logger.Error(err, "Failed to close async client")
+		}
+	}()
+
+	// ── Phase 1: Submit ────────────────────────────────────────────────────
+	type pendingRequest struct {
+		batchReqID string
+		customID   string
+	}
+
+	pending := make(map[string]*pendingRequest)
+	var submitCount int
+
+	for _, entry := range entries {
+		if requestAbortCtx.Err() != nil {
+			logger.V(logging.INFO).Info("Async submit aborted", "submitted", len(pending), "total", len(entries), "reason", requestAbortCtx.Err())
+			break
+		}
+
+		req, batchReqID, parseErr, readErr := readRequestLine(inputFile, entry, logger)
+		if readErr != nil {
+			return readErr
+		}
+		if parseErr != nil {
+			lineBytes, err := json.Marshal(parseErr)
+			if err != nil {
+				return fmt.Errorf("marshal parse error line: %w", err)
+			}
+			lineBytes = append(lineBytes, '\n')
+			if err := writers.write(lineBytes, true); err != nil {
+				return fmt.Errorf("write parse error line: %w", err)
+			}
+			progress.record(requestAbortCtx, false)
+			submitCount++
+			continue
+		}
+
+		if errors.Is(sloCtx.Err(), context.DeadlineExceeded) {
+			break
+		}
+
+		headers := maps.Clone(passThroughHeaders)
+		headers = mergeInferenceHeaders(headers, sloCtx, p.cfg.InferenceObjectiveFor(modelID), p.fairnessID(tenantID))
+
+		inferReq := &inference.GenerateRequest{
+			RequestID: batchReqID,
+			Endpoint:  req.URL,
+			Params:    req.Body,
+			Headers:   headers,
+		}
+
+		if submitErr := asyncClient.Submit(requestAbortCtx, inferReq); submitErr != nil {
+			out := newErrorOutputLine(batchReqID, req.CustomID,
+				string(submitErr.Category), submitErr.Message)
+			lineBytes, err := json.Marshal(out)
+			if err != nil {
+				return fmt.Errorf("marshal submit error line: %w", err)
+			}
+			lineBytes = append(lineBytes, '\n')
+			if err := writers.write(lineBytes, true); err != nil {
+				return fmt.Errorf("write submit error line: %w", err)
+			}
+			progress.record(requestAbortCtx, false)
+			submitCount++
+			continue
+		}
+
+		pending[batchReqID] = &pendingRequest{
+			batchReqID: batchReqID,
+			customID:   req.CustomID,
+		}
+		submitCount++
+	}
+
+	logger.V(logging.INFO).Info("Submit phase complete", "submitted", len(pending), "total", submitCount)
+
+	// ── Phase 2: Collect ───────────────────────────────────────────────────
+	var modelErr error
+
+	for len(pending) > 0 {
+		resp, err := asyncClient.GetResult(requestAbortCtx)
+		if err != nil && requestAbortCtx.Err() == nil {
+			logger.Error(err, "Failed to collect async result", "pendingCount", len(pending))
+			modelErr = fmt.Errorf("async result collection failed: %w", err)
+			break
+		}
+
+		pr, ok := pending[resp.RequestID]
+		if !ok {
+			logger.V(logging.TRACE).Info("Ignoring result for unknown request", "requestID", resp.RequestID)
+			continue
+		}
+
+		out := buildOutputLine(pr.batchReqID, pr.customID, modelID, resp.RequestID, resp, nil, logger)
+		if err := writeResult(out, sloCtx, userCancelCtx, requestAbortCtx, writers, progress); err != nil {
+			modelErr = err
+			break
+		}
+		delete(pending, resp.RequestID)
+	}
+
+	// Drain submitted-but-uncollected requests as errors so that
+	// output_lines + error_lines == total_requests.
+	for _, pr := range pending {
+		out := newErrorOutputLine(pr.batchReqID, pr.customID,
+			string(batch_types.ErrCodeBatchExpired), "result not collected before deadline")
+		lineBytes, err := json.Marshal(out)
+		if err != nil {
+			return fmt.Errorf("marshal uncollected error line: %w", err)
+		}
+		lineBytes = append(lineBytes, '\n')
+		if err := writers.write(lineBytes, true); err != nil {
+			return fmt.Errorf("write uncollected error line: %w", err)
+		}
+		progress.record(requestAbortCtx, false)
+	}
+
+	return drainAndFinalize(requestAbortCtx, mainCtx, sloCtx, userCancelCtx,
+		inputFile, entries[submitCount:], writers, progress, modelErr, logger, len(entries))
 }
 
-func (p *asyncModelProcessor) collect() {
+func (a *asyncModelProcessor) collect() {
 
 }
