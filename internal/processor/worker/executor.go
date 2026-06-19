@@ -890,7 +890,9 @@ func (s *syncModelProcessor) submit(
 	plansDir, safeModelID, modelID string,
 	passThroughHeaders map[string]string,
 	tenantID string,
-) error {
+) (retErr error) {
+	defer func() { s.errCh <- retErr; close(s.errCh) }()
+
 	p := s.processor
 	logger := logr.FromContextOrDiscard(requestAbortCtx).WithValues("model", modelID)
 	requestAbortCtx = logr.NewContext(requestAbortCtx, logger)
@@ -978,9 +980,7 @@ dispatch:
 	wg.Wait()
 
 	reason := resolveStopReason(sloCtx, userCancelCtx, mainCtx, requestAbortCtx, modelErr)
-	finalErr := drainAndFinalize(s.inputFile, entries[dispatchedCount:], s.pw, modelErr, logger, len(entries), reason)
-	s.errCh <- finalErr
-	return finalErr
+	return drainAndFinalize(s.inputFile, entries[dispatchedCount:], s.pw, modelErr, logger, len(entries), reason)
 }
 
 func (s *syncModelProcessor) collect(ctx context.Context) error {
@@ -1091,13 +1091,13 @@ func (a *asyncModelProcessor) submit(
 	return nil
 }
 
-func (a *asyncModelProcessor) collect(ctx context.Context) error {
+func (a *asyncModelProcessor) collect(ctx context.Context) (retErr error) {
+	defer func() { a.errCh <- retErr; close(a.errCh) }()
+
 	if a.submitErr != nil {
-		a.errCh <- a.submitErr
 		return a.submitErr
 	}
 	if a.asyncClient == nil {
-		a.errCh <- nil
 		return nil
 	}
 	defer func() {
@@ -1139,7 +1139,5 @@ func (a *asyncModelProcessor) collect(ctx context.Context) error {
 	if modelErr != nil {
 		reason = stopFailed
 	}
-	collectErr := drainAndFinalize(a.inputFile, a.entries[a.submitCount:], a.pw, modelErr, a.logger, len(a.entries), reason)
-	a.errCh <- collectErr
-	return collectErr
+	return drainAndFinalize(a.inputFile, a.entries[a.submitCount:], a.pw, modelErr, a.logger, len(a.entries), reason)
 }
