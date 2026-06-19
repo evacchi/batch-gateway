@@ -568,7 +568,11 @@ func (p *Processor) processModelAsync(
 			inference.ErrCodeModelNotFound)
 		return nil
 	}
-	defer func() { _ = asyncClient.Close() }()
+	defer func() {
+		if err := asyncClient.Close(); err != nil {
+			logger.Error(err, "Failed to close async client")
+		}
+	}()
 
 	// ── Phase 1: Submit ────────────────────────────────────────────────────
 	type pendingRequest struct {
@@ -581,6 +585,7 @@ func (p *Processor) processModelAsync(
 
 	for _, entry := range entries {
 		if requestAbortCtx.Err() != nil {
+			logger.V(logging.INFO).Info("Async submit aborted", "submitted", len(pending), "total", len(entries), "reason", requestAbortCtx.Err())
 			break
 		}
 
@@ -646,11 +651,9 @@ func (p *Processor) processModelAsync(
 
 	for len(pending) > 0 {
 		resp, err := asyncClient.GetResult(requestAbortCtx)
-		if err != nil {
-			if requestAbortCtx.Err() == nil {
-				logger.Error(err, "Failed to collect async result", "pendingCount", len(pending))
-				modelErr = fmt.Errorf("async result collection failed: %w", err)
-			}
+		if err != nil && requestAbortCtx.Err() == nil {
+			logger.Error(err, "Failed to collect async result", "pendingCount", len(pending))
+			modelErr = fmt.Errorf("async result collection failed: %w", err)
 			break
 		}
 
@@ -985,9 +988,9 @@ func writeResult(
 			Message: "This request was cancelled while in progress.",
 		}
 		progress.record(progressCtx, false)
-	} else {
-		progress.record(progressCtx, out.isSuccess())
 	}
+
+	progress.record(progressCtx, out.isSuccess())
 
 	lineBytes, err := json.Marshal(out)
 	if err != nil {
