@@ -34,6 +34,34 @@ import (
 // Common helpers
 // ---------------------------------------------------------------------------
 
+// processModel is a test helper that wraps the syncModelProcessor with a
+// progressWorker, matching the old processModel method signature so existing
+// tests don't need to change their callsites.
+func (p *Processor) processModel(
+	requestAbortCtx, mainCtx, sloCtx, userCancelCtx context.Context,
+	inputFile *os.File,
+	plansDir, safeModelID, modelID string,
+	writers *outputWriters,
+	progress *executionProgress,
+	passThroughHeaders map[string]string,
+	tenantID string,
+) error {
+	pw := newProgressWorker(requestAbortCtx, writers, progress)
+	pwErrCh := make(chan error, 1)
+	go func() { pwErrCh <- pw.run() }()
+
+	mp := &syncModelProcessor{processor: p}
+	err := mp.submit(requestAbortCtx, mainCtx, sloCtx, userCancelCtx, inputFile, plansDir, safeModelID, modelID, pw, passThroughHeaders, tenantID)
+
+	pw.close()
+	pwErr := <-pwErrCh
+
+	if err == nil {
+		err = pwErr
+	}
+	return err
+}
+
 func testLogger(t testing.TB) logr.Logger {
 	return testr.NewWithInterface(t, testr.Options{})
 }
