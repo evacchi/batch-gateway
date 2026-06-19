@@ -1355,15 +1355,14 @@ func (s *syncModelProcessor) collect(
 }
 
 type asyncModelProcessor struct {
-	processor      *Processor
-	asyncClient    inference.AsyncInferenceClient
-	pending        map[string]*pendingRequest
-	entries        []planEntry
-	submitCount    int
-	modelID        string
-	logger         logr.Logger
-	reason         stopReason
-	userCancelled  bool
+	processor   *Processor
+	asyncClient inference.AsyncInferenceClient
+	pending     map[string]*pendingRequest
+	entries     []planEntry
+	submitCount int
+	modelID     string
+	logger      logr.Logger
+	reason      stopReason
 }
 
 func (a *asyncModelProcessor) submit(
@@ -1469,7 +1468,6 @@ func (a *asyncModelProcessor) submit(
 
 	logger.V(logging.INFO).Info("Submit phase complete", "submitted", len(a.pending), "total", a.submitCount)
 	a.reason = resolveStopReason(sloCtx, userCancelCtx, mainCtx, requestAbortCtx, nil)
-	a.userCancelled = sloCtx.Err() == nil && userCancelCtx.Err() != nil
 	return nil
 }
 
@@ -1507,7 +1505,7 @@ func (a *asyncModelProcessor) collect(
 		}
 
 		out := buildOutputLine(pr.batchReqID, pr.customID, a.modelID, resp.RequestID, resp, nil, a.logger)
-		if err := writeResult(out, a.userCancelled, ctx, writers, progress); err != nil {
+		if err := writeResult(out, a.reason == stopCancelled, ctx, writers, progress); err != nil {
 			modelErr = err
 			break
 		}
