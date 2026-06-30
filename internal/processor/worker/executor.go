@@ -286,8 +286,6 @@ func (p *Processor) executeJob(ctx, sloCtx, userCancelCtx, requestAbortCtx conte
 	collector := newResultCollector(outputBuf, errorBuf, progress, logger)
 	collector.start()
 
-	errCh := make(chan error, len(modelMap.SafeToModel))
-
 	passThroughHeaders := params.jobInfo.PassThroughHeaders
 	if len(passThroughHeaders) > 0 {
 		headerNames := make([]string, 0, len(passThroughHeaders))
@@ -297,20 +295,26 @@ func (p *Processor) executeJob(ctx, sloCtx, userCancelCtx, requestAbortCtx conte
 		logger.V(logging.DEBUG).Info("pass-through headers attached to job", "headerNames", headerNames)
 	}
 
-	// User-initiated cancellation: watchCancel calls userCancelFn() only.
-	// context.AfterFunc(userCancelCtx, requestAbortFn) — wired in runJob — then
-	// cancels requestAbortCtx to stop the dispatch loop. userCancelCtx is isolated
-	// from sloCtx (derived from context.Background), so SLO expiry and SIGTERM do
-	// not set it. processModel's drain phase checks sloCtx.Err() vs
-	// userCancelCtx.Err() to choose the right error code (errExpired vs errCancelled).
 	tenantID := params.jobInfo.TenantID
 
+	// Error handler: iterates over all model results, aborts siblings on first
+	// error, then determines the final outcome by checking context state.
+	// SIGTERM is NOT checked: output is already flushed to disk, so the caller
+	// should proceed to finalizeJob rather than re-enqueueing a complete job.
+	nModels := len(modelMap.SafeToModel)
+	modelErrCh := make(chan error, nModels)
+	errorHandlerCh := make(chan error, 1)
+	go p.handleErrors(
+		sloCtx,
+		userCancelCtx,
+		params,
+		nModels,
+		modelErrCh,
+		errorHandlerCh)
+
 	for safeModelID, modelID := range modelMap.SafeToModel {
-		// Ordering guarantee: processModel returns → requestAbortFn → errCh send.
-		// This ensures the first real error reaches errCh before any context.Canceled
-		// from other models whose contexts were cancelled by requestAbortFn.
-		go func(safeModelID, modelID string) {
-			err := p.processModel(
+		go func() {
+			modelErrCh <- p.processModel(
 				requestAbortCtx,
 				ctx,
 				sloCtx,
@@ -321,72 +325,61 @@ func (p *Processor) executeJob(ctx, sloCtx, userCancelCtx, requestAbortCtx conte
 				passThroughHeaders,
 				tenantID,
 			)
-			// Abort all sibling models when any model hits a fatal I/O error
-			// (e.g. output file write failure). modelErr is only set for local
-			// I/O failures — not inference errors, which are recorded normally
-			// in the error file. Since all models share the same output writers,
-			// a write failure in one model means the shared file is unusable
-			// and continuing other models would produce corrupt output.
-			// Guard against nil requestAbortFn for direct-call test paths.
-			if err != nil {
-				if fn := params.requestAbortFn; fn != nil {
-					fn()
-				}
-			}
-			errCh <- err
-		}(safeModelID, modelID)
+		}()
 	}
 
-	var firstErr error
-	for range modelMap.SafeToModel {
-		if err := <-errCh; err != nil && firstErr == nil {
-			firstErr = err
-		}
-	}
+	resultErr := <-errorHandlerCh
 
 	collector.flush()
-
-	// Push final progress to the status store so the last throttled update doesn't
-	// leave stale counts visible to polling clients.
 	progress.flush(ctx)
-
-	if firstErr != nil {
-		// processModel already drained undispatched entries and returned a sentinel (errExpired or
-		// errCancelled) or the underlying system error. All terminal handlers now use detached
-		// contexts, so we preserve processModel's decision even when SIGTERM is concurrent.
-		counts := progress.counts()
-		switch {
-		case errors.Is(firstErr, errExpired):
-			logger.V(logging.INFO).Info("Execution SLO expired, returning partial counts",
-				"total", counts.Total, "completed", counts.Completed, "failed", counts.Failed)
-		case errors.Is(firstErr, errCancelled):
-			logger.V(logging.INFO).Info("Execution cancelled, returning partial counts",
-				"total", counts.Total, "completed", counts.Completed, "failed", counts.Failed)
-		default:
-			logger.V(logging.INFO).Info("Execution system error, returning partial counts",
-				"total", counts.Total, "completed", counts.Completed, "failed", counts.Failed)
-		}
-		return counts, firstErr
-	}
-
 	counts := progress.counts()
-	logger.V(logging.INFO).Info("Execution completed",
-		"total", counts.Total, "completed", counts.Completed, "failed", counts.Failed)
 
-	// A terminal signal may have arrived after all requests completed normally.
-	// SLO expiry and user cancel affect the job's terminal status even when all
-	// requests finished — e.g. "completed but past SLO" vs "completed".
-	// SIGTERM is NOT checked here: all output is already flushed to disk and counts
-	// are final, so the caller should proceed to finalizeJob (which uses a detached
-	// context) rather than re-enqueueing a fully-complete job.
+	var msg string
+	logKeyVals := []any{
+		"total", counts.Total,
+		"completed", counts.Completed,
+		"failed", counts.Failed,
+	}
+	if resultErr != nil {
+		msg = "Execution finished"
+		logKeyVals = append(logKeyVals,
+			"error", resultErr.Error())
+	} else {
+		msg = "Execution completed"
+	}
+	logger.V(logging.INFO).Info(msg, logKeyVals)
+	return counts, resultErr
+}
+
+func (p *Processor) handleErrors(
+	sloCtx context.Context,
+	userCancelCtx context.Context,
+	params *jobExecutionParams,
+	nModels int,
+	errCh chan error,
+	resultCh chan error) {
+	var firstErr error
+	for range nModels {
+		if err := <-errCh; err != nil && firstErr == nil {
+			firstErr = err
+			if fn := params.requestAbortFn; fn != nil {
+				fn()
+			}
+		}
+	}
+	// wait for all model goroutines to finish before signaling executeJob to flush.
+	if firstErr != nil {
+		resultCh <- firstErr
+		return
+	}
 	switch {
 	case errors.Is(sloCtx.Err(), context.DeadlineExceeded):
-		return counts, errExpired
+		resultCh <- errExpired
 	case userCancelCtx.Err() != nil:
-		return counts, errCancelled
+		resultCh <- errCancelled
+	default:
+		resultCh <- nil
 	}
-
-	return counts, nil
 }
 
 // processModel processes all plan entries for a single model concurrently.
