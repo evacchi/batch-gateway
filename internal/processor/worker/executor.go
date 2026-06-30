@@ -43,29 +43,6 @@ import (
 	"github.com/llm-d/llm-d-batch-gateway/pkg/clients/inference"
 )
 
-// outputWriters holds the buffered writers and their mutexes for the output and error JSONL files.
-// A single instance is created per job and shared across model goroutines.
-type outputWriters struct {
-	output   *bufio.Writer
-	outputMu sync.Mutex
-	errors   *bufio.Writer
-	errorsMu sync.Mutex
-}
-
-// write writes line to the error file if isError is true, otherwise to the output file.
-func (w *outputWriters) write(line []byte, isError bool) error {
-	if isError {
-		w.errorsMu.Lock()
-		defer w.errorsMu.Unlock()
-		_, err := w.errors.Write(line)
-		return err
-	}
-	w.outputMu.Lock()
-	defer w.outputMu.Unlock()
-	_, err := w.output.Write(line)
-	return err
-}
-
 // outputLine represents a single line in the output JSONL file following the OpenAI batch output format.
 type outputLine struct {
 	ID       string                    `json:"id"`
@@ -292,10 +269,8 @@ func (p *Processor) executeJob(ctx, sloCtx, userCancelCtx, requestAbortCtx conte
 	}
 	defer errorFile.Close()
 
-	writers := &outputWriters{
-		output: bufio.NewWriterSize(outputFile, 1024*1024),
-		errors: bufio.NewWriterSize(errorFile, 1024*1024),
-	}
+	outputBuf := bufio.NewWriterSize(outputFile, 1024*1024)
+	errorBuf := bufio.NewWriterSize(errorFile, 1024*1024)
 
 	plansDir, err := p.jobPlansDir(params.jobInfo.JobID, params.jobInfo.TenantID)
 	if err != nil {
@@ -307,6 +282,9 @@ func (p *Processor) executeJob(ctx, sloCtx, userCancelCtx, requestAbortCtx conte
 
 	progress := newExecutionProgress(params.updater, params.jobInfo.JobID, modelMap.LineCount, modelMap.RejectedCount)
 	progress.start(ctx)
+
+	collector := newResultCollector(outputBuf, errorBuf, progress, logger)
+	collector.start()
 
 	errCh := make(chan error, len(modelMap.SafeToModel))
 
@@ -339,8 +317,7 @@ func (p *Processor) executeJob(ctx, sloCtx, userCancelCtx, requestAbortCtx conte
 				userCancelCtx,
 				inputFile,
 				plansDir, safeModelID, modelID,
-				writers,
-				progress,
+				collector,
 				passThroughHeaders,
 				tenantID,
 			)
@@ -367,20 +344,13 @@ func (p *Processor) executeJob(ctx, sloCtx, userCancelCtx, requestAbortCtx conte
 		}
 	}
 
-	// Push final progress to Redis so the last throttled update doesn't
+	collector.flush()
+
+	// Push final progress to the status store so the last throttled update doesn't
 	// leave stale counts visible to polling clients.
 	progress.flush(ctx)
 
 	if firstErr != nil {
-		// Flush partial results to disk before routing the error.
-		// Required for all non-nil firstErr paths: errExpired, errCancelled, system errors
-		// (callers upload from disk), and SIGTERM (startup recovery reads from disk on restart).
-		if err := writers.output.Flush(); err != nil {
-			logger.Error(err, "Failed to flush output file on error path (partial results may be truncated)")
-		}
-		if err := writers.errors.Flush(); err != nil {
-			logger.Error(err, "Failed to flush error file on error path (partial results may be truncated)")
-		}
 		// processModel already drained undispatched entries and returned a sentinel (errExpired or
 		// errCancelled) or the underlying system error. All terminal handlers now use detached
 		// contexts, so we preserve processModel's decision even when SIGTERM is concurrent.
@@ -397,13 +367,6 @@ func (p *Processor) executeJob(ctx, sloCtx, userCancelCtx, requestAbortCtx conte
 				"total", counts.Total, "completed", counts.Completed, "failed", counts.Failed)
 		}
 		return counts, firstErr
-	}
-
-	if err := writers.output.Flush(); err != nil {
-		return nil, fmt.Errorf("failed to flush output file: %w", err)
-	}
-	if err := writers.errors.Flush(); err != nil {
-		return nil, fmt.Errorf("failed to flush error file: %w", err)
 	}
 
 	counts := progress.counts()
@@ -446,8 +409,7 @@ func (p *Processor) processModel(
 	userCancelCtx context.Context,
 	inputFile *os.File,
 	plansDir, safeModelID, modelID string,
-	writers *outputWriters,
-	progress *executionProgress,
+	collector *resultCollector,
 	passThroughHeaders map[string]string,
 	tenantID string,
 ) error {
@@ -471,7 +433,7 @@ func (p *Processor) processModel(
 	epLimit := p.endpointLimits[client]
 	if epLimit == nil {
 		logger.V(logging.INFO).Info("No endpoint limit for model (client not in resolver), draining as model_not_found")
-		p.drainUnprocessedRequests(requestAbortCtx, inputFile, entries, writers, progress,
+		p.drainUnprocessedRequests(requestAbortCtx, inputFile, entries, collector,
 			batch_types.BatchErrorCode(inference.ErrCodeModelNotFound))
 		return nil
 	}
@@ -512,7 +474,7 @@ dispatch:
 			defer endpointSem.Release()
 			defer p.globalSem.Release()
 
-			result, execErr := p.executeOneRequest(requestAbortCtx, sloCtx, inputFile, entry, modelID, passThroughHeaders, tenantID)
+			outLine, execErr := p.executeOneRequest(requestAbortCtx, sloCtx, inputFile, entry, modelID, passThroughHeaders, tenantID)
 
 			// AIMD signal: adjust concurrency based on inference endpoint capacity.
 			//
@@ -528,8 +490,8 @@ dispatch:
 			//
 			// AIMD only affects future dispatch. It does not abort in-flight
 			// requests — those continue until completion or context cancellation.
-			if epLimit.aimd != nil && execErr == nil && result != nil && result.Response != nil {
-				sc := result.Response.StatusCode
+			if epLimit.aimd != nil && execErr == nil && outLine != nil && outLine.Response != nil {
+				sc := outLine.Response.StatusCode
 				switch {
 				case sc == http.StatusTooManyRequests:
 					epLimit.aimd.RecordRateLimit(metrics.AIMDSignal429)
@@ -537,7 +499,7 @@ dispatch:
 				case sc >= http.StatusInternalServerError:
 					epLimit.aimd.RecordRateLimit(metrics.AIMDSignal5xx)
 					metrics.RecordAIMDDecrease(epLimit.label, metrics.AIMDSignal5xx)
-				case result.hadCapacityRetry:
+				case outLine.hadCapacityRetry:
 					epLimit.aimd.RecordRateLimit(metrics.AIMDSignalCapacityRetry)
 					metrics.RecordAIMDDecrease(epLimit.label, metrics.AIMDSignalCapacityRetry)
 				default:
@@ -561,55 +523,26 @@ dispatch:
 			}
 
 			// If user-initiated cancel arrived while this request was in-flight,
-			// overwrite the result as batch_cancelled and write to the error file
-			// so that output lines + error lines == total requests.
+			// overwrite the result as batch_cancelled and send to the collector.
 			// SLO expiry does not overwrite in-flight results — only user cancel does.
 			if sloCtx.Err() == nil && userCancelCtx.Err() != nil {
-				result.Response = nil
-				result.Error = &outputError{
-					Code:    string(batch_types.ErrCodeBatchCancelled),
-					Message: "This request was cancelled while in progress.",
-				}
-				progress.record(requestAbortCtx, false)
-
-				lineBytes, marshalErr := json.Marshal(result)
-				if marshalErr != nil {
-					errOnce.Do(func() {
-						modelErr = fmt.Errorf("marshal cancelled output line at offset %d: %w", entry.Offset, marshalErr)
-					})
-					return
-				}
-				lineBytes = append(lineBytes, '\n')
-				if writeErr := writers.write(lineBytes, true); writeErr != nil {
-					errOnce.Do(func() { modelErr = fmt.Errorf("write cancelled output line at offset %d: %w", entry.Offset, writeErr) })
-				}
+				collector.collect(&ResultItem{
+					RequestID: outLine.ID,
+					CustomID:  outLine.CustomID,
+					Error: &OutputError{
+						Code:    string(batch_types.ErrCodeBatchCancelled),
+						Message: "This request was cancelled while in progress.",
+					},
+				})
 				return
 			}
 
-			if result.Error != nil && mainCtx.Err() != nil {
+			if outLine.Error != nil && mainCtx.Err() != nil {
 				shutdownCancelled.Add(1)
 			}
 
-			progress.record(requestAbortCtx, result.isSuccess())
-
-			lineBytes, marshalErr := json.Marshal(result)
-			if marshalErr != nil {
-				errOnce.Do(func() { modelErr = fmt.Errorf("marshal output line at offset %d: %w", entry.Offset, marshalErr) })
-				return
-			}
-			lineBytes = append(lineBytes, '\n')
-
-			// Write to error file only for non-HTTP errors (error field populated).
-			// HTTP error responses (4xx/5xx) go to output file since they carry a valid
-			// response object with status_code and body per the OpenAI batch spec.
-			isError := result.Error != nil
-			if writeErr := writers.write(lineBytes, isError); writeErr != nil {
-				kind := "output"
-				if isError {
-					kind = "error"
-				}
-				errOnce.Do(func() { modelErr = fmt.Errorf("write %s line at offset %d: %w", kind, entry.Offset, writeErr) })
-			}
+			result := outputLineToResultItem(outLine)
+			collector.collect(result)
 		}(entry)
 	}
 
@@ -627,7 +560,7 @@ dispatch:
 		// SLO deadline fired during dispatch — record remaining requests as expired.
 		if len(undispatched) > 0 {
 			logger.V(logging.INFO).Info("SLO expired: draining undispatched entries", "count", len(undispatched))
-			p.drainUnprocessedRequests(requestAbortCtx, inputFile, undispatched, writers, progress,
+			p.drainUnprocessedRequests(requestAbortCtx, inputFile, undispatched, collector,
 				batch_types.ErrCodeBatchExpired)
 		}
 		returnErr = errExpired
@@ -636,7 +569,7 @@ dispatch:
 		// User-initiated cancel — record remaining requests as cancelled.
 		if len(undispatched) > 0 {
 			logger.V(logging.INFO).Info("Cancelled: draining undispatched entries", "count", len(undispatched))
-			p.drainUnprocessedRequests(requestAbortCtx, inputFile, undispatched, writers, progress,
+			p.drainUnprocessedRequests(requestAbortCtx, inputFile, undispatched, collector,
 				batch_types.ErrCodeBatchCancelled)
 		}
 		returnErr = errCancelled
@@ -645,7 +578,7 @@ dispatch:
 		// System error in a model goroutine — record remaining requests as failed.
 		if len(undispatched) > 0 {
 			logger.V(logging.INFO).Info("Fatal error: draining undispatched entries", "count", len(undispatched))
-			p.drainUnprocessedRequests(requestAbortCtx, inputFile, undispatched, writers, progress,
+			p.drainUnprocessedRequests(requestAbortCtx, inputFile, undispatched, collector,
 				batch_types.ErrCodeBatchFailed)
 		}
 		returnErr = modelErr
@@ -664,7 +597,7 @@ dispatch:
 			// Drain undispatched entries as batch_failed so that
 			// completed + failed == total holds for the job.
 			logger.V(logging.INFO).Info("Sibling abort: draining undispatched entries", "count", len(undispatched))
-			p.drainUnprocessedRequests(requestAbortCtx, inputFile, undispatched, writers, progress,
+			p.drainUnprocessedRequests(requestAbortCtx, inputFile, undispatched, collector,
 				batch_types.ErrCodeBatchFailed)
 		}
 	}
@@ -674,22 +607,35 @@ dispatch:
 	return returnErr
 }
 
-// drainUnprocessedRequests records undispatched requests in the error file when a job terminates
-// mid-execution (SLO expiry, cancellation, or systemic failure). For each plan entry, it reads
-// the original request from input.jsonl to extract the custom_id, then writes an error line with
-// the given error code and its canonical message.
+// outputLineToResultItem converts an outputLine (returned by executeOneRequest) to a
+// ResultItem for the collector.
+func outputLineToResultItem(ol *outputLine) *ResultItem {
+	var outErr *OutputError
+	if ol.Error != nil {
+		outErr = &OutputError{Code: ol.Error.Code, Message: ol.Error.Message}
+	}
+	return &ResultItem{
+		RequestID:        ol.ID,
+		CustomID:         ol.CustomID,
+		Response:         ol.Response,
+		Error:            outErr,
+		HadCapacityRetry: ol.hadCapacityRetry,
+	}
+}
+
+// drainUnprocessedRequests sends error entries for undispatched plan entries to
+// the collector. Called from processModel when dispatch is interrupted (SLO
+// expiry, cancellation, or systemic failure). For each entry it reads the
+// original request from input.jsonl to extract the custom_id.
 func (p *Processor) drainUnprocessedRequests(
 	ctx context.Context,
 	inputFile *os.File,
 	entries []planEntry,
-	writers *outputWriters,
-	progress *executionProgress,
+	collector *resultCollector,
 	errCode batch_types.BatchErrorCode,
 ) {
 	errMessage := errCode.Message()
-	logger := logr.FromContextOrDiscard(ctx)
 
-	// Allocate a single read buffer sized to the largest entry to avoid per-entry allocations.
 	var maxLen uint32
 	for _, e := range entries {
 		if e.Length > maxLen {
@@ -707,32 +653,11 @@ func (p *Processor) drainUnprocessedRequests(
 			}
 		}
 
-		requestID := uuid.NewString()
-
-		line := &outputLine{
-			ID:       newBatchRequestID(requestID),
-			CustomID: customID,
-			Error: &outputError{
-				Code:    string(errCode),
-				Message: errMessage,
-			},
-		}
-
-		lineBytes, err := json.Marshal(line)
-		if err != nil {
-			logger.Error(err, "Failed to marshal drain entry", "errCode", errCode, "offset", entry.Offset)
-			continue
-		}
-		lineBytes = append(lineBytes, '\n')
-
-		if writeErr := writers.write(lineBytes, true); writeErr != nil {
-			logger.Error(writeErr, "Failed to write drain entry", "errCode", errCode, "offset", entry.Offset)
-		}
-
-		// Context may be cancelled here (e.g. SLO deadline fired), so the Redis progress
-		// update inside record() may fail silently. The atomic counter still increments
-		// correctly and the final counts are committed by the terminal status update.
-		progress.record(ctx, false)
+		collector.collect(&ResultItem{
+			RequestID: newBatchRequestID(uuid.NewString()),
+			CustomID:  customID,
+			Error:     &OutputError{Code: string(errCode), Message: errMessage},
+		})
 	}
 }
 
