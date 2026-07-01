@@ -2811,6 +2811,53 @@ func TestExecutionProgress_Flush(t *testing.T) {
 	}
 }
 
+// TestExecutionProgress_RecordAfterContextCancel verifies that record() does not
+// block when the context passed to start() is cancelled. Before the fix, run()
+// would exit on ctx.Done(), leaving no receiver on ep.ch — subsequent record()
+// calls would deadlock once the channel buffer filled.
+func TestExecutionProgress_RecordAfterContextCancel(t *testing.T) {
+	orig := progressUpdateInterval
+	progressUpdateInterval = time.Hour
+	t.Cleanup(func() { progressUpdateInterval = orig })
+
+	statusClient := &countingStatusClient{BatchStatusClient: mockdb.NewMockBatchStatusClient()}
+	updater := NewStatusUpdater(newMockBatchDBClient(), statusClient, 86400)
+
+	ctx, cancel := context.WithCancel(testLoggerCtx(t))
+	progress := newExecutionProgress(updater, "job-ctx-cancel", 2048, 0)
+	progress.start(ctx)
+
+	// Cancel the context before sending any events. In the buggy code this
+	// would cause run() to exit immediately.
+	cancel()
+
+	// Send more events than the channel buffer (1024) to guarantee a
+	// deadlock if nobody is receiving.
+	done := make(chan struct{})
+	go func() {
+		for i := 0; i < 2048; i++ {
+			progress.record(ctx, i%2 == 0)
+		}
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("record() blocked after context cancellation — run() exited and left no receiver")
+	}
+
+	progress.flush(ctx)
+
+	counts := progress.counts()
+	if counts.Completed != 1024 {
+		t.Fatalf("completed = %d, want 1024", counts.Completed)
+	}
+	if counts.Failed != 1024 {
+		t.Fatalf("failed = %d, want 1024", counts.Failed)
+	}
+}
+
 // =====================================================================
 // Tests: jsonNumericToFloat64
 // =====================================================================
