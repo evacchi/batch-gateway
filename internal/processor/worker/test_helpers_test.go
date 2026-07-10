@@ -505,7 +505,7 @@ func setupExecutionJob(
 	allEntries := planEntriesFromLines(rawInput)
 
 	safeToModel := make(map[string]string, len(modelToSafe))
-	modelEntries := make(map[string][]planEntry)
+	modelEntries := make(map[string][]PlanEntry)
 	for model, safe := range modelToSafe {
 		safeToModel[safe] = model
 	}
@@ -520,7 +520,7 @@ func setupExecutionJob(
 		writePlanFile(t, plansDir, safe, entries)
 	}
 
-	writeModelMap(t, jobRootDir, modelMapFile{
+	writeModelMap(t, jobRootDir, ModelMapFile{
 		ModelToSafe: modelToSafe,
 		SafeToModel: safeToModel,
 		LineCount:   int64(len(requests)),
@@ -559,7 +559,7 @@ func createPartialOutputFiles(t *testing.T, p *Processor, jobID, tenantID string
 // File / plan helpers
 // ---------------------------------------------------------------------------
 
-func writePlanFile(t *testing.T, dir, safeModelID string, entries []planEntry) {
+func writePlanFile(t *testing.T, dir, safeModelID string, entries []PlanEntry) {
 	t.Helper()
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatalf("MkdirAll plans dir: %v", err)
@@ -578,13 +578,13 @@ func writePlanFile(t *testing.T, dir, safeModelID string, entries []planEntry) {
 	}
 }
 
-func writeModelMap(t *testing.T, jobRootDir string, mm modelMapFile) {
+func writeModelMap(t *testing.T, jobRootDir string, mm ModelMapFile) {
 	t.Helper()
 	data, err := json.Marshal(mm)
 	if err != nil {
 		t.Fatalf("marshal model map: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(jobRootDir, modelMapFileName), data, 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(jobRootDir, ModelMapFileName), data, 0o644); err != nil {
 		t.Fatalf("write model map: %v", err)
 	}
 }
@@ -609,15 +609,15 @@ func writeInputJSONL(t *testing.T, path string, requests []batch_types.Request) 
 }
 
 // planEntriesFromLines computes plan entries from the raw input bytes (one entry per line).
-func planEntriesFromLines(raw []byte) []planEntry {
-	var entries []planEntry
+func planEntriesFromLines(raw []byte) []PlanEntry {
+	var entries []PlanEntry
 	offset := int64(0)
 	for _, line := range bytes.Split(raw, []byte{'\n'}) {
 		if len(line) == 0 {
 			continue
 		}
 		length := uint32(len(line) + 1) // include trailing '\n'
-		entries = append(entries, planEntry{Offset: offset, Length: length})
+		entries = append(entries, PlanEntry{Offset: offset, Length: length})
 		offset += int64(length)
 	}
 	return entries
@@ -673,21 +673,21 @@ func makeInputLinesWithSystemPrompts(specs []inputLineSpec) [][]byte {
 }
 
 // testReadPlanEntries reads plan entries from a single plan file (test helper).
-func testReadPlanEntries(t *testing.T, planPath string) []planEntry {
+func testReadPlanEntries(t *testing.T, planPath string) []PlanEntry {
 	t.Helper()
 	b, err := os.ReadFile(planPath)
 	if err != nil {
 		t.Fatalf("read plan file: %v", err)
 	}
-	if len(b)%planEntrySize != 0 {
-		t.Fatalf("plan file size not multiple of %d: %d", planEntrySize, len(b))
+	if len(b)%PlanEntrySize != 0 {
+		t.Fatalf("plan file size not multiple of %d: %d", PlanEntrySize, len(b))
 	}
 
-	n := len(b) / planEntrySize
-	out := make([]planEntry, 0, n)
+	n := len(b) / PlanEntrySize
+	out := make([]PlanEntry, 0, n)
 	for i := 0; i < n; i++ {
-		var buf [planEntrySize]byte
-		copy(buf[:], b[i*planEntrySize:(i+1)*planEntrySize])
+		var buf [PlanEntrySize]byte
+		copy(buf[:], b[i*PlanEntrySize:(i+1)*PlanEntrySize])
 		out = append(out, unmarshalPlanEntry(buf))
 	}
 	return out

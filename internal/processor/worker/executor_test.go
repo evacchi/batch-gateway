@@ -242,7 +242,7 @@ func TestExecuteOneRequest_NilInferenceClient(t *testing.T) {
 	}
 	writePlanFile(t, plansDir, "m1", allEntries)
 
-	writeModelMap(t, jobRootDir, modelMapFile{
+	writeModelMap(t, jobRootDir, ModelMapFile{
 		ModelToSafe: map[string]string{"m1": "m1"},
 		SafeToModel: map[string]string{"m1": "m1"},
 		LineCount:   1,
@@ -520,7 +520,7 @@ func TestExecuteOneRequest_BadOffset(t *testing.T) {
 	inputFile, _ := os.Open(inputPath)
 	defer inputFile.Close()
 
-	badEntry := planEntry{Offset: 99999, Length: 10}
+	badEntry := PlanEntry{Offset: 99999, Length: 10}
 	ctx := testLoggerCtx(t)
 	sloCtx, sloCancel := context.WithDeadline(ctx, time.Now().Add(1*time.Second))
 	defer sloCancel()
@@ -3844,7 +3844,7 @@ func setupAsyncExecutionJob(
 	allEntries := planEntriesFromLines(rawInput)
 
 	safeToModel := make(map[string]string, len(modelToSafe))
-	modelEntries := make(map[string][]planEntry)
+	modelEntries := make(map[string][]PlanEntry)
 	for model, safe := range modelToSafe {
 		safeToModel[safe] = model
 	}
@@ -3858,7 +3858,7 @@ func setupAsyncExecutionJob(
 		writePlanFile(t, plansDir, safe, entries)
 	}
 
-	writeModelMap(t, jobRootDir, modelMapFile{
+	writeModelMap(t, jobRootDir, ModelMapFile{
 		ModelToSafe: modelToSafe,
 		SafeToModel: safeToModel,
 		LineCount:   int64(len(requests)),

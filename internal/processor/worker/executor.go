@@ -188,7 +188,7 @@ func (p *Processor) executeJob(ctx, sloCtx, userCancelCtx, requestAbortCtx conte
 		return nil, fmt.Errorf("failed to resolve job root directory: %w", err)
 	}
 
-	modelMap, err := readModelMap(jobRootDir)
+	modelMap, err := ReadModelMap(jobRootDir)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read model map: %w", err)
 	}
@@ -418,7 +418,7 @@ func (p *Processor) processModel(
 	requestAbortCtx = logr.NewContext(requestAbortCtx, logger)
 
 	planPath := filepath.Join(plansDir, safeModelID+".plan")
-	entries, err := readPlanEntries(planPath)
+	entries, err := ReadPlanEntries(planPath)
 	if err != nil {
 		return fmt.Errorf("model setup failed: read plan for model %s: %w", modelID, err)
 	}
@@ -470,7 +470,7 @@ dispatch:
 
 		dispatchedCount = i + 1
 		wg.Add(1)
-		go func(entry planEntry) {
+		go func(entry PlanEntry) {
 			defer wg.Done()
 			defer endpointSem.Release()
 			defer p.globalSem.Release()
@@ -559,7 +559,7 @@ func (p *Processor) processModelAsync(
 	requestAbortCtx = logr.NewContext(requestAbortCtx, logger)
 
 	planPath := filepath.Join(plansDir, safeModelID+".plan")
-	entries, err := readPlanEntries(planPath)
+	entries, err := ReadPlanEntries(planPath)
 	if err != nil {
 		return fmt.Errorf("model setup failed: read plan for model %s: %w", modelID, err)
 	}
@@ -707,7 +707,7 @@ func (p *Processor) drainAndFinalize(
 	sloCtx context.Context,
 	userCancelCtx context.Context,
 	inputFile *os.File,
-	undispatched []planEntry,
+	undispatched []PlanEntry,
 	writers *outputWriters,
 	progress *executionProgress,
 	modelErr error,
@@ -775,7 +775,7 @@ func (p *Processor) drainAndFinalize(
 func (p *Processor) drainUnprocessedRequests(
 	ctx context.Context,
 	inputFile *os.File,
-	entries []planEntry,
+	entries []PlanEntry,
 	writers *outputWriters,
 	progress *executionProgress,
 	errCode batch_types.BatchErrorCode,
@@ -886,7 +886,7 @@ func mergeInferenceHeaders(headers map[string]string, sloCtx context.Context, in
 // readRequestLine reads a single plan entry from the input file, parses it, and
 // generates a batch request ID. Returns the parsed request and batch request ID
 // on success, an outputLine on parse error, or a fatal error on I/O failure.
-func readRequestLine(inputFile *os.File, entry planEntry, logger logr.Logger) (*batch_types.Request, string, *outputLine, error) {
+func readRequestLine(inputFile *os.File, entry PlanEntry, logger logr.Logger) (*batch_types.Request, string, *outputLine, error) {
 	buf := make([]byte, entry.Length)
 	if _, err := inputFile.ReadAt(buf, entry.Offset); err != nil {
 		return nil, "", nil, fmt.Errorf("%w at offset %d: %w", errRequestInputRead, entry.Offset, err)
@@ -917,7 +917,7 @@ func (p *Processor) executeOneRequest(
 	ctx context.Context,
 	sloCtx context.Context,
 	inputFile *os.File,
-	entry planEntry,
+	entry PlanEntry,
 	modelID string,
 	passThroughHeaders map[string]string,
 	tenantID string,

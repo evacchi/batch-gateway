@@ -42,8 +42,10 @@ type AsyncClientConfig struct {
 // Immutable after construction — safe for concurrent reads.
 type AsyncGatewayResolver struct {
 	pools           map[string]*asyncPool // model → pool
+	sharedClients   map[string]*asyncSharedClient
 	closers         []io.Closer
 	clientFactories map[string]func() AsyncInferenceClient // test-only override
+	logger          logr.Logger
 }
 
 // ClientFor creates a fresh per-job async client for the given model.
@@ -60,6 +62,31 @@ func (r *AsyncGatewayResolver) ClientFor(modelID string) AsyncInferenceClient {
 		return nil
 	}
 	return newAsyncProducerClient(pool)
+}
+
+// SharedClientFor returns a shared client for the given model.
+// Unlike ClientFor, it reuses the same client across calls —
+// results are not routed per-request, any consumer can read them.
+func (r *AsyncGatewayResolver) SharedClientFor(modelID string) AsyncInferenceClient {
+	if r.clientFactories != nil {
+		if factory, ok := r.clientFactories[modelID]; ok {
+			return factory()
+		}
+		return nil
+	}
+	if c, ok := r.sharedClients[modelID]; ok {
+		return c
+	}
+	pool, ok := r.pools[modelID]
+	if !ok {
+		return nil
+	}
+	if r.sharedClients == nil {
+		r.sharedClients = make(map[string]*asyncSharedClient)
+	}
+	c := newAsyncSharedClient(pool, defaultResultBufferSize, r.logger.WithValues("model", modelID))
+	r.sharedClients[modelID] = c
+	return c
 }
 
 // NewTestAsyncResolver creates a resolver backed by factory functions instead of
