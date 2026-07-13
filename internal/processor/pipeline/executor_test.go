@@ -57,7 +57,7 @@ func TestJobExecutorEndToEnd(t *testing.T) {
 
 	executor := NewJobExecutor(JobExecutorConfig{
 		Source:     &sliceSource{items: items},
-		Dispatcher: NewDirectDispatcher(resolver, pending, logr.Discard()),
+		Dispatcher: NewDirectDispatcher(resolver, logr.Discard()),
 		Collector:  collector,
 		Tracker:    tracker,
 		Logger:     logr.Discard(),
@@ -121,7 +121,7 @@ func TestJobExecutorWithErrors(t *testing.T) {
 
 	executor := NewJobExecutor(JobExecutorConfig{
 		Source:     &sliceSource{items: items},
-		Dispatcher: NewDirectDispatcher(resolver, pending, logr.Discard()),
+		Dispatcher: NewDirectDispatcher(resolver, logr.Discard()),
 		Collector:  collector,
 		Tracker:    tracker,
 		Logger:     logr.Discard(),
@@ -172,7 +172,7 @@ func TestJobExecutorCancellation(t *testing.T) {
 
 	executor := NewJobExecutor(JobExecutorConfig{
 		Source:     source,
-		Dispatcher: NewDirectDispatcher(resolver, pending, logr.Discard()),
+		Dispatcher: NewDirectDispatcher(resolver, logr.Discard()),
 		Collector:  collector,
 		Tracker:    tracker,
 		Logger:     logr.Discard(),
@@ -224,7 +224,7 @@ func TestJobExecutorMultipleModels(t *testing.T) {
 
 	executor := NewJobExecutor(JobExecutorConfig{
 		Source:     &sliceSource{items: items},
-		Dispatcher: NewDirectDispatcher(resolver, pending, logr.Discard()),
+		Dispatcher: NewDirectDispatcher(resolver, logr.Discard()),
 		Collector:  collector,
 		Tracker:    tracker,
 		Logger:     logr.Discard(),
@@ -287,7 +287,7 @@ func TestJobExecutorMultipleModels_ModelNotFound(t *testing.T) {
 
 	executor := NewJobExecutor(JobExecutorConfig{
 		Source:     &sliceSource{items: items},
-		Dispatcher: NewDirectDispatcher(resolver, pending, logr.Discard()),
+		Dispatcher: NewDirectDispatcher(resolver, logr.Discard()),
 		Collector:  collector,
 		Tracker:    tracker,
 		Logger:     logr.Discard(),
@@ -356,7 +356,7 @@ func TestJobExecutorSeparatesSuccessAndErrors(t *testing.T) {
 
 	executor := NewJobExecutor(JobExecutorConfig{
 		Source:     &sliceSource{items: items},
-		Dispatcher: NewDirectDispatcher(resolver, pending, logr.Discard()),
+		Dispatcher: NewDirectDispatcher(resolver, logr.Discard()),
 		Collector:  collector,
 		Tracker:    tracker,
 		Logger:     logr.Discard(),
@@ -437,7 +437,7 @@ func TestJobExecutorHTTPErrorGoesToOutputFile(t *testing.T) {
 
 	executor := NewJobExecutor(JobExecutorConfig{
 		Source:     &sliceSource{items: items},
-		Dispatcher: NewDirectDispatcher(resolver, pending, logr.Discard()),
+		Dispatcher: NewDirectDispatcher(resolver, logr.Discard()),
 		Collector:  collector,
 		Tracker:    tracker,
 		Logger:     logr.Discard(),

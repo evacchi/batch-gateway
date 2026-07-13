@@ -93,12 +93,6 @@ func (d *AIMDDispatcher) Run(ctx context.Context, requestCh <-chan RequestItem, 
 	return nil
 }
 
-func (d *AIMDDispatcher) Receive(_ context.Context, _ RequestItem, _ chan<- ResultItem) {
-	panic("AIMDDispatcher.Receive should not be called directly; use Run")
-}
-
-func (d *AIMDDispatcher) Close() {}
-
 func (d *AIMDDispatcher) acquireSlot(ctx context.Context, modelID string) error {
 	ep := d.models[modelID]
 	if ep != nil {

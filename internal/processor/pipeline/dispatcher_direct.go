@@ -19,15 +19,14 @@ import (
 // DirectDispatcher dispatches requests to an inference gateway via HTTP client.
 type DirectDispatcher struct {
 	inference *inference.GatewayResolver
-	pending   *PendingRequests
 	logger    logr.Logger
 	wg        sync.WaitGroup
 }
 
 var _ RequestDispatcher = (*DirectDispatcher)(nil)
 
-func NewDirectDispatcher(resolver *inference.GatewayResolver, pending *PendingRequests, logger logr.Logger) *DirectDispatcher {
-	return &DirectDispatcher{inference: resolver, pending: pending, logger: logger}
+func NewDirectDispatcher(resolver *inference.GatewayResolver, logger logr.Logger) *DirectDispatcher {
+	return &DirectDispatcher{inference: resolver, logger: logger}
 }
 
 func (d *DirectDispatcher) Run(ctx context.Context, requestCh <-chan RequestItem, resultCh chan<- ResultItem) error {
@@ -37,65 +36,63 @@ func (d *DirectDispatcher) Run(ctx context.Context, requestCh <-chan RequestItem
 			resultCh <- *msg.Canceled()
 			break
 		}
-		d.Receive(ctx, msg, resultCh)
+		d.handleMessage(ctx, msg, resultCh)
 	}
 	// If the loop broke early, drain remaining requests as cancelled.
 	// If it completed normally (channel closed), this is a no-op.
 	for msg := range requestCh {
 		resultCh <- *msg.Canceled()
 	}
-	d.Close()
+	d.wg.Wait()
 	close(resultCh)
 	return nil
 }
 
-func (d *DirectDispatcher) Close() {
-	d.wg.Wait()
-}
+func (d *DirectDispatcher) handleMessage(
+	ctx context.Context, msg RequestItem, resultCh chan<- ResultItem) {
 
-func (d *DirectDispatcher) Receive(ctx context.Context, msg RequestItem, resultCh chan<- ResultItem) {
-	// Register pending before dispatch so the collector can match results.
-	d.pending.Store(msg)
-
+	// Find inference client for the model
 	client := d.inference.ClientFor(msg.ModelID)
+
+	// If the model is unknown return an error.
 	if client == nil {
-		resultCh <- ResultItem{
-			RequestID: msg.RequestID,
-			Error: &OutputError{
-				Code:    inference.ErrCodeModelNotFound,
-				Message: fmt.Sprintf("model %q not configured", msg.ModelID),
-			},
-		}
+		resultCh <- *msg.ModelNotFound()
 		return
 	}
 
+	// Otherwise spawn a request in a go routine.
 	d.wg.Add(1)
 	go func() {
 		defer d.wg.Done()
-
-		req := &inference.GenerateRequest{
-			RequestID: msg.RequestID,
-			Endpoint:  msg.Endpoint,
-			Params:    msg.Body,
-			Headers:   msg.Headers,
-		}
-
-		start := time.Now()
-		metrics.IncProcessorInflightRequests()
-		metrics.IncModelInflightRequests(msg.ModelID)
-
-		resp, clientErr := client.Generate(ctx, req)
-
-		metrics.DecModelInflightRequests(msg.ModelID)
-		metrics.DecProcessorInflightRequests()
-		metrics.RecordModelRequestExecutionDuration(time.Since(start), msg.ModelID)
-
-		result := buildResult(msg, resp, clientErr, d.logger)
-		if ctx.Err() != nil && result.Error != nil && result.Response == nil {
-			result.Error = &OutputError{Code: "batch_cancelled", Message: "request cancelled"}
-		}
-		resultCh <- result
+		d.submitRequest(ctx, msg, client, resultCh)
 	}()
+}
+
+func (d *DirectDispatcher) submitRequest(
+	ctx context.Context, msg RequestItem, client inference.InferenceClient, resultCh chan<- ResultItem) {
+
+	req := &inference.GenerateRequest{
+		RequestID: msg.RequestID,
+		Endpoint:  msg.Endpoint,
+		Params:    msg.Body,
+		Headers:   msg.Headers,
+	}
+
+	start := time.Now()
+	metrics.IncProcessorInflightRequests()
+	metrics.IncModelInflightRequests(msg.ModelID)
+
+	resp, clientErr := client.Generate(ctx, req)
+
+	metrics.DecModelInflightRequests(msg.ModelID)
+	metrics.DecProcessorInflightRequests()
+	metrics.RecordModelRequestExecutionDuration(time.Since(start), msg.ModelID)
+
+	result := buildResult(msg, resp, clientErr, d.logger)
+	if ctx.Err() != nil && result.Error != nil && result.Response == nil {
+		result.Error = &OutputError{Code: "batch_cancelled", Message: "request cancelled"}
+	}
+	resultCh <- result
 }
 
 func buildResult(msg RequestItem, resp *inference.GenerateResponse, clientErr *inference.ClientError, logger logr.Logger) ResultItem {

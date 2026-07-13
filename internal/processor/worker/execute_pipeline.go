@@ -129,7 +129,7 @@ func (p *Processor) resolveRequestDispatcher(modelMap *pipeline.ModelMap, pendin
 		broadcasters := p.broadcasters.forModels(modelMap)
 		dispatcher = pipeline.NewAsyncDispatcher(p.asyncInference, broadcasters, pending, logger)
 	} else {
-		dispatcher = pipeline.NewDirectDispatcher(p.inference, pending, logger)
+		dispatcher = pipeline.NewDirectDispatcher(p.inference, logger)
 		if p.cfg.Concurrency.AIMD.Enabled {
 			models := buildAIMDModels(modelMap, p.inference, p.endpointLimits)
 			dispatcher = pipeline.NewAIMDDispatcher(dispatcher, models, p.cfg.Concurrency.Global, logger)

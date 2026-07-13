@@ -1,7 +1,10 @@
 package pipeline
 
 import (
+	"fmt"
+
 	batch_types "github.com/llm-d/llm-d-batch-gateway/internal/shared/types"
+	"github.com/llm-d/llm-d-batch-gateway/pkg/clients/inference"
 )
 
 // RequestItem is a fully-parsed inference request ready for dispatch.
@@ -25,11 +28,19 @@ type ResultItem struct {
 }
 
 func (r *RequestItem) Canceled() *ResultItem {
+	return r.Error("batch_cancelled", "request cancelled")
+}
+
+func (r *RequestItem) ModelNotFound() *ResultItem {
+	return r.Error(inference.ErrCodeModelNotFound, fmt.Sprintf("model %q not configured", r.ModelID))
+}
+
+func (r *RequestItem) Error(code, message string) *ResultItem {
 	return &ResultItem{
 		RequestID: r.RequestID,
 		CustomID:  r.CustomID,
 		ModelID:   r.ModelID,
-		Error:     &OutputError{Code: "batch_cancelled", Message: "request cancelled"},
+		Error:     &OutputError{Code: code, Message: message},
 	}
 }
 

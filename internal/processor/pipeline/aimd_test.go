@@ -48,7 +48,7 @@ func makeEndpointAIMD(t *testing.T, perEndpoint int) (*semaphore.AdaptiveSemapho
 	return sem, aimd
 }
 
-func runPipeline(t *testing.T, items []RequestItem, pending *PendingRequests, dispatcher RequestDispatcher) (outputData, errorData []byte, counts *int64, failedCounts *int64) {
+func runPipeline(t *testing.T, items []RequestItem, dispatcher RequestDispatcher) (outputData, errorData []byte, counts *int64, failedCounts *int64) {
 	t.Helper()
 	outputFile := tempFile(t)
 	errorFile := tempFile(t)
@@ -84,13 +84,12 @@ func TestAIMDSignaling(t *testing.T) {
 		sem, aimd := makeEndpointAIMD(t, maxLimit)
 		globalLimit := 100
 
-		pending := &PendingRequests{}
-		direct := NewDirectDispatcher(resolver, pending, logr.Discard())
+		direct := NewDirectDispatcher(resolver, logr.Discard())
 		dispatcher := NewAIMDDispatcher(direct,
 			map[string]*EndpointAIMD{"m1": {Sem: sem, AIMD: aimd, Label: "test"}},
 			globalLimit, logr.Discard())
 
-		runPipeline(t, makeItems(maxLimit, "m1"), pending, dispatcher)
+		runPipeline(t, makeItems(maxLimit, "m1"), dispatcher)
 
 		if got := aimd.Limit(); got != maxLimit {
 			t.Errorf("Limit() = %d, want %d (no decrease for clean 200s)", got, maxLimit)
@@ -105,13 +104,12 @@ func TestAIMDSignaling(t *testing.T) {
 		sem, aimd := makeEndpointAIMD(t, maxLimit)
 		globalLimit := 100
 
-		pending := &PendingRequests{}
-		direct := NewDirectDispatcher(resolver, pending, logr.Discard())
+		direct := NewDirectDispatcher(resolver, logr.Discard())
 		dispatcher := NewAIMDDispatcher(direct,
 			map[string]*EndpointAIMD{"m1": {Sem: sem, AIMD: aimd, Label: "test"}},
 			globalLimit, logr.Discard())
 
-		runPipeline(t, makeItems(1, "m1"), pending, dispatcher)
+		runPipeline(t, makeItems(1, "m1"), dispatcher)
 
 		if got := aimd.Limit(); got >= maxLimit {
 			t.Errorf("Limit() = %d, want < %d (should decrease on 429)", got, maxLimit)
@@ -126,13 +124,12 @@ func TestAIMDSignaling(t *testing.T) {
 		sem, aimd := makeEndpointAIMD(t, maxLimit)
 		globalLimit := 100
 
-		pending := &PendingRequests{}
-		direct := NewDirectDispatcher(resolver, pending, logr.Discard())
+		direct := NewDirectDispatcher(resolver, logr.Discard())
 		dispatcher := NewAIMDDispatcher(direct,
 			map[string]*EndpointAIMD{"m1": {Sem: sem, AIMD: aimd, Label: "test"}},
 			globalLimit, logr.Discard())
 
-		runPipeline(t, makeItems(1, "m1"), pending, dispatcher)
+		runPipeline(t, makeItems(1, "m1"), dispatcher)
 
 		if got := aimd.Limit(); got >= maxLimit {
 			t.Errorf("Limit() = %d, want < %d (should decrease on 5xx)", got, maxLimit)
@@ -147,13 +144,12 @@ func TestAIMDSignaling(t *testing.T) {
 		sem, aimd := makeEndpointAIMD(t, maxLimit)
 		globalLimit := 100
 
-		pending := &PendingRequests{}
-		direct := NewDirectDispatcher(resolver, pending, logr.Discard())
+		direct := NewDirectDispatcher(resolver, logr.Discard())
 		dispatcher := NewAIMDDispatcher(direct,
 			map[string]*EndpointAIMD{"m1": {Sem: sem, AIMD: aimd, Label: "test"}},
 			globalLimit, logr.Discard())
 
-		runPipeline(t, makeItems(1, "m1"), pending, dispatcher)
+		runPipeline(t, makeItems(1, "m1"), dispatcher)
 
 		if got := aimd.Limit(); got >= maxLimit {
 			t.Errorf("Limit() = %d, want < %d (should decrease on capacity retry)", got, maxLimit)
@@ -175,14 +171,13 @@ func TestAIMDSignaling(t *testing.T) {
 
 		items := append(makeItems(1, "model-a"), makeItems(maxLimit, "model-b")...)
 
-		pending := &PendingRequests{}
-		direct := NewDirectDispatcher(resolver, pending, logr.Discard())
+		direct := NewDirectDispatcher(resolver, logr.Discard())
 		dispatcher := NewAIMDDispatcher(direct, map[string]*EndpointAIMD{
 			"model-a": {Sem: semA, AIMD: aimdA, Label: "ep-a"},
 			"model-b": {Sem: semB, AIMD: aimdB, Label: "ep-b"},
 		}, globalLimit, logr.Discard())
 
-		runPipeline(t, items, pending, dispatcher)
+		runPipeline(t, items, dispatcher)
 
 		if got := aimdA.Limit(); got >= maxLimit {
 			t.Errorf("model-a Limit() = %d, want < %d (429s should decrease)", got, maxLimit)
@@ -221,8 +216,7 @@ func TestCancelDrainsUndispatched(t *testing.T) {
 	tracker := NewProgressTracker(int64(len(items)), nil, "test-job", logr.Discard())
 	collector := NewResultCollector(outputFile, errorFile, &PendingRequests{}, tracker, logr.Discard())
 
-	pending := &PendingRequests{}
-	direct := NewDirectDispatcher(resolver, pending, logr.Discard())
+	direct := NewDirectDispatcher(resolver, logr.Discard())
 	dispatcher := NewAIMDDispatcher(direct,
 		map[string]*EndpointAIMD{"m1": {Sem: sem, AIMD: aimd, Label: "test"}},
 		globalLimit, logr.Discard())
@@ -307,8 +301,7 @@ func TestCancelWithFastRequestsThrottled(t *testing.T) {
 	tracker := NewProgressTracker(int64(totalRequests), nil, "test-job", logr.Discard())
 	collector := NewResultCollector(outputFile, errorFile, &PendingRequests{}, tracker, logr.Discard())
 
-	pending := &PendingRequests{}
-	direct := NewDirectDispatcher(resolver, pending, logr.Discard())
+	direct := NewDirectDispatcher(resolver, logr.Discard())
 	dispatcher := NewAIMDDispatcher(direct,
 		map[string]*EndpointAIMD{"m1": {Sem: sem, AIMD: aimd, Label: "test"}},
 		globalLimit, logr.Discard())
@@ -391,8 +384,7 @@ func TestCancelInProgressThrottled(t *testing.T) {
 	tracker := NewProgressTracker(int64(totalRequests), nil, "test-job", logr.Discard())
 	collector := NewResultCollector(outputFile, errorFile, &PendingRequests{}, tracker, logr.Discard())
 
-	pending := &PendingRequests{}
-	direct := NewDirectDispatcher(resolver, pending, logr.Discard())
+	direct := NewDirectDispatcher(resolver, logr.Discard())
 	dispatcher := NewAIMDDispatcher(direct,
 		map[string]*EndpointAIMD{"m1": {Sem: sem, AIMD: aimd, Label: "test"}},
 		globalLimit, logr.Discard())
@@ -499,8 +491,7 @@ func TestCancelInProgress(t *testing.T) {
 	tracker := NewProgressTracker(int64(totalRequests), nil, "test-job", logr.Discard())
 	collector := NewResultCollector(outputFile, errorFile, &PendingRequests{}, tracker, logr.Discard())
 
-	pending := &PendingRequests{}
-	direct := NewDirectDispatcher(resolver, pending, logr.Discard())
+	direct := NewDirectDispatcher(resolver, logr.Discard())
 	dispatcher := NewAIMDDispatcher(direct,
 		map[string]*EndpointAIMD{"m1": {Sem: sem, AIMD: aimd, Label: "test"}},
 		globalLimit, logr.Discard())
@@ -575,8 +566,7 @@ func TestExpiration(t *testing.T) {
 	tracker := NewProgressTracker(int64(numRequests), nil, "test-job", logr.Discard())
 	collector := NewResultCollector(outputFile, errorFile, &PendingRequests{}, tracker, logr.Discard())
 
-	pending := &PendingRequests{}
-	direct := NewDirectDispatcher(resolver, pending, logr.Discard())
+	direct := NewDirectDispatcher(resolver, logr.Discard())
 	dispatcher := NewAIMDDispatcher(direct,
 		map[string]*EndpointAIMD{"m1": {Sem: sem, AIMD: aimd, Label: "test"}},
 		globalLimit, logr.Discard())
@@ -625,8 +615,7 @@ func TestRetryExhaustion(t *testing.T) {
 	tracker := NewProgressTracker(int64(len(items)), nil, "test-job", logr.Discard())
 	collector := NewResultCollector(outputFile, errorFile, &PendingRequests{}, tracker, logr.Discard())
 
-	pending := &PendingRequests{}
-	direct := NewDirectDispatcher(resolver, pending, logr.Discard())
+	direct := NewDirectDispatcher(resolver, logr.Discard())
 
 	executor := NewJobExecutor(JobExecutorConfig{
 		Source:     &sliceSource{items: items},

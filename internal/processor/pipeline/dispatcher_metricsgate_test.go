@@ -46,8 +46,7 @@ func TestMetricsGateDispatcher_BudgetAboveBaseline(t *testing.T) {
 	resolver := inference.NewSingleClientResolver(client)
 	defer func() { _ = resolver.Close() }()
 
-	pending := &PendingRequests{}
-	direct := NewDirectDispatcher(resolver, pending, logr.Discard())
+	direct := NewDirectDispatcher(resolver, logr.Discard())
 
 	budget := &fixedBudgetSource{budget: 0.8}
 	gate := NewMetricsGateDispatcher(direct, budget, 0.5, 50*time.Millisecond, logr.Discard())
@@ -87,8 +86,7 @@ func TestMetricsGateDispatcher_BudgetBelowBaseline_Cancelled(t *testing.T) {
 	resolver := inference.NewSingleClientResolver(client)
 	defer func() { _ = resolver.Close() }()
 
-	pending := &PendingRequests{}
-	direct := NewDirectDispatcher(resolver, pending, logr.Discard())
+	direct := NewDirectDispatcher(resolver, logr.Discard())
 
 	budget := &fixedBudgetSource{budget: 0.1}
 	gate := NewMetricsGateDispatcher(direct, budget, 0.5, 10*time.Millisecond, logr.Discard())
@@ -135,8 +133,7 @@ func TestMetricsGateDispatcher_BudgetReadError_AllowsThrough(t *testing.T) {
 	resolver := inference.NewSingleClientResolver(client)
 	defer func() { _ = resolver.Close() }()
 
-	pending := &PendingRequests{}
-	direct := NewDirectDispatcher(resolver, pending, logr.Discard())
+	direct := NewDirectDispatcher(resolver, logr.Discard())
 
 	budget := &errorBudgetSource{}
 	gate := NewMetricsGateDispatcher(direct, budget, 0.5, 10*time.Millisecond, logr.Discard())
@@ -170,8 +167,7 @@ func TestMetricsGateDispatcher_BudgetRecovery(t *testing.T) {
 	resolver := inference.NewSingleClientResolver(client)
 	defer func() { _ = resolver.Close() }()
 
-	pending := &PendingRequests{}
-	direct := NewDirectDispatcher(resolver, pending, logr.Discard())
+	direct := NewDirectDispatcher(resolver, logr.Discard())
 
 	budget := &sequenceBudgetSource{
 		values: []DispatchBudget{0.8, 0.8, 0.8},

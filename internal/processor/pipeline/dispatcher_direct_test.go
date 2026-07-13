@@ -247,11 +247,10 @@ func TestDirectDispatcher_ModelNotFound(t *testing.T) {
 	})
 	defer func() { _ = resolver.Close() }()
 
-	pending := &PendingRequests{}
-	dispatcher := NewDirectDispatcher(resolver, pending, logr.Discard())
+	dispatcher := NewDirectDispatcher(resolver, logr.Discard())
 
 	resultCh := make(chan ResultItem, 1)
-	dispatcher.Receive(context.Background(), RequestItem{
+	dispatcher.handleMessage(context.Background(), RequestItem{
 		RequestID: "req-bad",
 		CustomID:  "c-bad",
 		ModelID:   "no-such-model",
@@ -264,6 +263,12 @@ func TestDirectDispatcher_ModelNotFound(t *testing.T) {
 	}
 	if result.Error.Code != inference.ErrCodeModelNotFound {
 		t.Fatalf("error code = %q, want %q", result.Error.Code, inference.ErrCodeModelNotFound)
+	}
+	if result.CustomID != "c-bad" {
+		t.Fatalf("CustomID = %q, want %q", result.CustomID, "c-bad")
+	}
+	if result.ModelID != "no-such-model" {
+		t.Fatalf("ModelID = %q, want %q", result.ModelID, "no-such-model")
 	}
 }
 

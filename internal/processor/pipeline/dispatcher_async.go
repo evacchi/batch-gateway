@@ -2,7 +2,6 @@ package pipeline
 
 import (
 	"context"
-	"fmt"
 
 	"github.com/go-logr/logr"
 
@@ -55,15 +54,7 @@ func (d *AsyncDispatcher) Run(ctx context.Context, requestCh <-chan RequestItem,
 
 		client := d.resolver.SharedClientFor(msg.ModelID)
 		if client == nil {
-			resultCh <- ResultItem{
-				RequestID: msg.RequestID,
-				CustomID:  msg.CustomID,
-				ModelID:   msg.ModelID,
-				Error: &OutputError{
-					Code:    inference.ErrCodeModelNotFound,
-					Message: fmt.Sprintf("model %q not configured", msg.ModelID),
-				},
-			}
+			resultCh <- *msg.ModelNotFound()
 			continue
 		}
 
@@ -77,16 +68,16 @@ func (d *AsyncDispatcher) Run(ctx context.Context, requestCh <-chan RequestItem,
 		}
 
 		if submitErr := client.Submit(ctx, req); submitErr != nil {
-			resultCh <- ResultItem{
-				RequestID: msg.RequestID,
-				CustomID:  msg.CustomID,
-				ModelID:   msg.ModelID,
-				Error:     &OutputError{Code: string(submitErr.Category), Message: submitErr.Message},
-			}
+			resultCh <- *msg.Error(
+				string(submitErr.Category),
+				submitErr.Message,
+			)
 			continue
 		}
 	}
-	// Drain remaining requests as cancelled.
+
+	// For above exists on error, or on channel closed
+	// Iterate to drain remaining requests as cancelled (if any).
 	for msg := range requestCh {
 		resultCh <- *msg.Canceled()
 	}
