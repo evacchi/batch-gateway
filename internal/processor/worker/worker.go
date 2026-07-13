@@ -135,6 +135,8 @@ func (p *Processor) Run(ctx context.Context, onReady func()) error {
 		return err
 	}
 
+	// If async inference is used (llm-d-async), set up a registry of ResultBroadcasters.
+	// These will propagate results from the async queues to the JobExecutor's individual result collectors.
 	if p.asyncInference != nil {
 		p.broadcasters = newBroadcasterRegistry(ctx, p.asyncInference, logger)
 		defer p.broadcasters.stop()
