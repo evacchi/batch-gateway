@@ -116,6 +116,123 @@ func TestAsyncEndToEnd(t *testing.T) {
 	}
 }
 
+func TestAsyncResult_NilResponseBody(t *testing.T) {
+	resp := &inference.GenerateResponse{
+		RequestID: "req-nil-body",
+		Response:  nil,
+	}
+	result := asyncResult(resp, logr.Discard())
+	if result.Error == nil {
+		t.Fatal("expected error for nil response body")
+	}
+	if result.Error.Code != "server_error" {
+		t.Fatalf("error code = %q, want %q", result.Error.Code, "server_error")
+	}
+	if result.Response != nil {
+		t.Fatalf("expected nil response, got %+v", result.Response)
+	}
+}
+
+func TestAsyncResult_BadJSONBody(t *testing.T) {
+	resp := &inference.GenerateResponse{
+		RequestID: "req-bad-json",
+		Response:  []byte(`{not valid json`),
+	}
+	result := asyncResult(resp, logr.Discard())
+	if result.Error == nil {
+		t.Fatal("expected error for bad JSON body")
+	}
+	if result.Error.Code != "parse_error" {
+		t.Fatalf("error code = %q, want %q", result.Error.Code, "parse_error")
+	}
+}
+
+func TestAsyncResult_Success(t *testing.T) {
+	resp := &inference.GenerateResponse{
+		RequestID: "req-ok",
+		Response:  []byte(`{"choices":[]}`),
+	}
+	result := asyncResult(resp, logr.Discard())
+	if result.Error != nil {
+		t.Fatalf("unexpected error: %+v", result.Error)
+	}
+	if result.Response == nil {
+		t.Fatal("expected response")
+	}
+	if result.Response.StatusCode != 200 {
+		t.Fatalf("StatusCode = %d, want 200", result.Response.StatusCode)
+	}
+	if result.Response.RequestID != "req-ok" {
+		t.Fatalf("RequestID = %q, want %q", result.Response.RequestID, "req-ok")
+	}
+}
+
+func TestAsyncDispatcher_ModelNotFound(t *testing.T) {
+	client := newFakeAsyncClient()
+	resolver := inference.NewTestAsyncResolver(map[string]func() inference.AsyncInferenceClient{
+		"m1": func() inference.AsyncInferenceClient { return client },
+	})
+	defer func() { _ = resolver.Close() }()
+
+	broadcaster := NewResultBroadcaster(client, logr.Discard())
+	broadcasterCtx, broadcasterCancel := context.WithCancel(context.Background())
+	defer broadcasterCancel()
+	go broadcaster.Run(broadcasterCtx)
+
+	items := []RequestItem{
+		{RequestID: "req-1", CustomID: "c-1", ModelID: "m1", Endpoint: "/v1/chat/completions"},
+		{RequestID: "req-2", CustomID: "c-2", ModelID: "no-such-model", Endpoint: "/v1/chat/completions"},
+	}
+
+	pending := &PendingRequests{}
+	outputFile := tempFile(t)
+	errorFile := tempFile(t)
+	tracker := NewProgressTracker(int64(len(items)), nil, "test-job", logr.Discard())
+	collector := NewResultCollector(outputFile, errorFile, pending, tracker, logr.Discard())
+
+	dispatcher := NewAsyncDispatcher(resolver,
+		map[string]*ResultBroadcaster{"m1": broadcaster},
+		pending, logr.Discard())
+
+	executor := NewJobExecutor(JobExecutorConfig{
+		Source:     &sliceSource{items: items},
+		Dispatcher: dispatcher,
+		Collector:  collector,
+		Tracker:    tracker,
+		Logger:     logr.Discard(),
+	})
+
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		client.deliver("req-1", map[string]any{"ok": true})
+	}()
+
+	counts, err := executor.Execute(context.Background())
+	if err != nil {
+		t.Fatalf("Execute() error: %v", err)
+	}
+
+	if counts.Completed != 1 {
+		t.Errorf("Completed = %d, want 1", counts.Completed)
+	}
+	if counts.Failed != 1 {
+		t.Errorf("Failed = %d, want 1", counts.Failed)
+	}
+
+	errorData := readFile(t, errorFile)
+	errorLines := splitLines(errorData)
+	if len(errorLines) != 1 {
+		t.Fatalf("error lines = %d, want 1", len(errorLines))
+	}
+	var errLine outputLine
+	if err := json.Unmarshal(errorLines[0], &errLine); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if errLine.Error == nil || errLine.Error.Code != "model_not_found" {
+		t.Fatalf("expected model_not_found, got %+v", errLine.Error)
+	}
+}
+
 func TestAsyncCancellation(t *testing.T) {
 	client := newFakeAsyncClient()
 	resolver := inference.NewTestAsyncResolver(map[string]func() inference.AsyncInferenceClient{
