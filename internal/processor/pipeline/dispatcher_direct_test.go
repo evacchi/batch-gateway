@@ -245,7 +245,7 @@ func TestDirectDispatcher_ModelNotFound(t *testing.T) {
 	resolver := inference.NewPerModelClientResolver(map[string]inference.InferenceClient{
 		"m1": &mockInferenceClient{response: []byte(`{}`)},
 	})
-	defer resolver.Close()
+	defer func() { _ = resolver.Close() }()
 
 	pending := &PendingRequests{}
 	dispatcher := NewDirectDispatcher(resolver, pending, logr.Discard())

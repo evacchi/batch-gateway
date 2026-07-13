@@ -106,7 +106,7 @@ func TestJobExecutorWithErrors(t *testing.T) {
 	resolver := inference.NewPerModelClientResolver(map[string]inference.InferenceClient{
 		"m1": &mockInferenceClient{response: []byte(`{}`)},
 	})
-	defer resolver.Close()
+	defer func() { _ = resolver.Close() }()
 
 	items := []RequestItem{
 		{RequestID: "req-1", CustomID: "c-1", ModelID: "m1", Endpoint: "/v1/chat/completions"},
@@ -155,7 +155,7 @@ func TestJobExecutorWithErrors(t *testing.T) {
 
 func TestJobExecutorCancellation(t *testing.T) {
 	resolver := inference.NewSingleClientResolver(&mockInferenceClient{response: []byte(`{}`)})
-	defer resolver.Close()
+	defer func() { _ = resolver.Close() }()
 
 	ctx, cancel := context.WithCancel(context.Background())
 
