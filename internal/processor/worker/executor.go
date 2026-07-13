@@ -279,34 +279,18 @@ func (p *Processor) executeJob(ctx, sloCtx, userCancelCtx, requestAbortCtx conte
 		// This ensures the first real error reaches errCh before any context.Canceled
 		// from other models whose contexts were cancelled by requestAbortFn.
 		go func(safeModelID, modelID string) {
-			var err error
-			if p.asyncInference != nil {
-				err = p.processModelAsync(
-					requestAbortCtx,
-					ctx,
-					sloCtx,
-					userCancelCtx,
-					inputFile,
-					plansDir, safeModelID, modelID,
-					writers,
-					progress,
-					passThroughHeaders,
-					tenantID,
-				)
-			} else {
-				err = p.processModel(
-					requestAbortCtx,
-					ctx,
-					sloCtx,
-					userCancelCtx,
-					inputFile,
-					plansDir, safeModelID, modelID,
-					writers,
-					progress,
-					passThroughHeaders,
-					tenantID,
-				)
-			}
+			err = p.processModel(
+				requestAbortCtx,
+				ctx,
+				sloCtx,
+				userCancelCtx,
+				inputFile,
+				plansDir, safeModelID, modelID,
+				writers,
+				progress,
+				passThroughHeaders,
+				tenantID,
+			)
 			// Abort all sibling models when any model hits a fatal I/O error
 			// (e.g. output file write failure). modelErr is only set for local
 			// I/O failures — not inference errors, which are recorded normally

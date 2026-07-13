@@ -15,7 +15,7 @@ import (
 	"github.com/llm-d/llm-d-batch-gateway/internal/util/logging"
 )
 
-func (p *Processor) executeJobV2(ctx, sloCtx, userCancelCtx, requestAbortCtx context.Context, params *jobExecutionParams) (*openai.BatchRequestCounts, error) {
+func (p *Processor) executeJobAsync(ctx, sloCtx, userCancelCtx, requestAbortCtx context.Context, params *jobExecutionParams) (*openai.BatchRequestCounts, error) {
 	logger := logr.FromContextOrDiscard(ctx)
 	logger.V(logging.INFO).Info("Starting execution (v2 pipeline)")
 
