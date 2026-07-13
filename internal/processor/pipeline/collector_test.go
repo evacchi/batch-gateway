@@ -12,7 +12,7 @@ import (
 func TestResultCollector_RoutesToCorrectFile(t *testing.T) {
 	outputFile := tempFile(t)
 	errorFile := tempFile(t)
-	pending := &PendingRequests{}
+	pending := NewPendingRequests()
 	tracker := NewProgressTracker(3, nil, "test-job", logr.Discard())
 	collector := NewResultCollector(outputFile, errorFile, pending, tracker, logr.Discard())
 
@@ -72,7 +72,7 @@ func TestResultCollector_RoutesToCorrectFile(t *testing.T) {
 func TestResultCollector_DrainSkipsUnknownPending(t *testing.T) {
 	outputFile := tempFile(t)
 	errorFile := tempFile(t)
-	pending := &PendingRequests{}
+	pending := NewPendingRequests()
 	tracker := NewProgressTracker(1, nil, "test-job", logr.Discard())
 	collector := NewResultCollector(outputFile, errorFile, pending, tracker, logr.Discard())
 

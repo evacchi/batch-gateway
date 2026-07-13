@@ -88,7 +88,10 @@ func (b *ResultBroadcaster) Run(ctx context.Context) {
 					}
 				}()
 
-				ch := v.(chan<- ResultItem)
+				ch, ok := v.(chan<- ResultItem)
+				if !ok {
+					return true
+				}
 				ch <- result
 
 				return true

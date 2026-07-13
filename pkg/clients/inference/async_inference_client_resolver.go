@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sync"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -41,9 +42,9 @@ type AsyncClientConfig struct {
 // backed by a shared producer and dispatcher per pool.
 // Immutable after construction — safe for concurrent reads.
 type AsyncGatewayResolver struct {
-	pools           map[string]*asyncPool // model → pool
-	sharedClients   map[string]*asyncSharedClient
-	closers         []io.Closer
+	pools         map[string]*asyncPool // model → pool
+	sharedClients sync.Map              // model → *asyncSharedClient
+	closers       []io.Closer
 	clientFactories map[string]func() AsyncInferenceClient // test-only override
 	logger          logr.Logger
 }
@@ -74,19 +75,16 @@ func (r *AsyncGatewayResolver) SharedClientFor(modelID string) AsyncInferenceCli
 		}
 		return nil
 	}
-	if c, ok := r.sharedClients[modelID]; ok {
-		return c
+	if c, ok := r.sharedClients.Load(modelID); ok {
+		return c.(*asyncSharedClient)
 	}
 	pool, ok := r.pools[modelID]
 	if !ok {
 		return nil
 	}
-	if r.sharedClients == nil {
-		r.sharedClients = make(map[string]*asyncSharedClient)
-	}
 	c := newAsyncSharedClient(pool.producer, pool.dispatcher.pollTimeout, r.logger.WithValues("model", modelID))
-	r.sharedClients[modelID] = c
-	return c
+	actual, _ := r.sharedClients.LoadOrStore(modelID, c)
+	return actual.(*asyncSharedClient)
 }
 
 // NewTestAsyncResolver creates a resolver backed by factory functions instead of

@@ -54,7 +54,7 @@ func runPipeline(t *testing.T, items []RequestItem, dispatcher RequestDispatcher
 	errorFile := tempFile(t)
 	total := int64(len(items))
 	tracker := NewProgressTracker(total, nil, "test-job", logr.Discard())
-	collector := NewResultCollector(outputFile, errorFile, &PendingRequests{}, tracker, logr.Discard())
+	collector := NewResultCollector(outputFile, errorFile, NewPendingRequests(), tracker, logr.Discard())
 
 	executor := NewJobExecutor(JobExecutorConfig{
 		Source:     &sliceSource{items: items},
@@ -214,7 +214,7 @@ func TestCancelDrainsUndispatched(t *testing.T) {
 	outputFile := tempFile(t)
 	errorFile := tempFile(t)
 	tracker := NewProgressTracker(int64(len(items)), nil, "test-job", logr.Discard())
-	collector := NewResultCollector(outputFile, errorFile, &PendingRequests{}, tracker, logr.Discard())
+	collector := NewResultCollector(outputFile, errorFile, NewPendingRequests(), tracker, logr.Discard())
 
 	direct := NewDirectDispatcher(resolver, logr.Discard())
 	dispatcher := NewAIMDDispatcher(direct,
@@ -299,7 +299,7 @@ func TestCancelWithFastRequestsThrottled(t *testing.T) {
 	outputFile := tempFile(t)
 	errorFile := tempFile(t)
 	tracker := NewProgressTracker(int64(totalRequests), nil, "test-job", logr.Discard())
-	collector := NewResultCollector(outputFile, errorFile, &PendingRequests{}, tracker, logr.Discard())
+	collector := NewResultCollector(outputFile, errorFile, NewPendingRequests(), tracker, logr.Discard())
 
 	direct := NewDirectDispatcher(resolver, logr.Discard())
 	dispatcher := NewAIMDDispatcher(direct,
@@ -382,7 +382,7 @@ func TestCancelInProgressThrottled(t *testing.T) {
 	outputFile := tempFile(t)
 	errorFile := tempFile(t)
 	tracker := NewProgressTracker(int64(totalRequests), nil, "test-job", logr.Discard())
-	collector := NewResultCollector(outputFile, errorFile, &PendingRequests{}, tracker, logr.Discard())
+	collector := NewResultCollector(outputFile, errorFile, NewPendingRequests(), tracker, logr.Discard())
 
 	direct := NewDirectDispatcher(resolver, logr.Discard())
 	dispatcher := NewAIMDDispatcher(direct,
@@ -489,7 +489,7 @@ func TestCancelInProgress(t *testing.T) {
 	outputFile := tempFile(t)
 	errorFile := tempFile(t)
 	tracker := NewProgressTracker(int64(totalRequests), nil, "test-job", logr.Discard())
-	collector := NewResultCollector(outputFile, errorFile, &PendingRequests{}, tracker, logr.Discard())
+	collector := NewResultCollector(outputFile, errorFile, NewPendingRequests(), tracker, logr.Discard())
 
 	direct := NewDirectDispatcher(resolver, logr.Discard())
 	dispatcher := NewAIMDDispatcher(direct,
@@ -564,7 +564,7 @@ func TestExpiration(t *testing.T) {
 	outputFile := tempFile(t)
 	errorFile := tempFile(t)
 	tracker := NewProgressTracker(int64(numRequests), nil, "test-job", logr.Discard())
-	collector := NewResultCollector(outputFile, errorFile, &PendingRequests{}, tracker, logr.Discard())
+	collector := NewResultCollector(outputFile, errorFile, NewPendingRequests(), tracker, logr.Discard())
 
 	direct := NewDirectDispatcher(resolver, logr.Discard())
 	dispatcher := NewAIMDDispatcher(direct,
@@ -613,7 +613,7 @@ func TestRetryExhaustion(t *testing.T) {
 	outputFile := tempFile(t)
 	errorFile := tempFile(t)
 	tracker := NewProgressTracker(int64(len(items)), nil, "test-job", logr.Discard())
-	collector := NewResultCollector(outputFile, errorFile, &PendingRequests{}, tracker, logr.Discard())
+	collector := NewResultCollector(outputFile, errorFile, NewPendingRequests(), tracker, logr.Discard())
 
 	direct := NewDirectDispatcher(resolver, logr.Discard())
 

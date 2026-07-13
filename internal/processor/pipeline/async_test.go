@@ -71,7 +71,7 @@ func TestAsyncEndToEnd(t *testing.T) {
 		{RequestID: "req-3", CustomID: "c-3", ModelID: "m1", Endpoint: "/v1/chat/completions"},
 	}
 
-	pending := &PendingRequests{}
+	pending := NewPendingRequests()
 	outputFile := tempFile(t)
 	errorFile := tempFile(t)
 	tracker := NewProgressTracker(int64(len(items)), nil, "test-job", logr.Discard())
@@ -184,7 +184,7 @@ func TestAsyncDispatcher_ModelNotFound(t *testing.T) {
 		{RequestID: "req-2", CustomID: "c-2", ModelID: "no-such-model", Endpoint: "/v1/chat/completions"},
 	}
 
-	pending := &PendingRequests{}
+	pending := NewPendingRequests()
 	outputFile := tempFile(t)
 	errorFile := tempFile(t)
 	tracker := NewProgressTracker(int64(len(items)), nil, "test-job", logr.Discard())
@@ -247,7 +247,7 @@ func TestAsyncCancellation(t *testing.T) {
 
 	items := makeItems(10, "m1")
 
-	pending := &PendingRequests{}
+	pending := NewPendingRequests()
 	outputFile := tempFile(t)
 	errorFile := tempFile(t)
 	tracker := NewProgressTracker(int64(len(items)), nil, "test-job", logr.Discard())

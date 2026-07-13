@@ -79,7 +79,7 @@ func (p *Processor) executeJobAsync(ctx, sloCtx, userCancelCtx, requestAbortCtx 
 	})
 
 	// The dispatcher forwards requests for processing.
-	pending := &pipeline.PendingRequests{}
+	pending := pipeline.NewPendingRequests()
 	dispatcher := p.resolveRequestDispatcher(
 		modelMap,
 		pending,

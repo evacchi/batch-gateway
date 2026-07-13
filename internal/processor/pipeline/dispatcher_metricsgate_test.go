@@ -56,7 +56,7 @@ func TestMetricsGateDispatcher_BudgetAboveBaseline(t *testing.T) {
 	outputFile := tempFile(t)
 	errorFile := tempFile(t)
 	tracker := NewProgressTracker(int64(len(items)), nil, "test-job", logr.Discard())
-	collector := NewResultCollector(outputFile, errorFile, &PendingRequests{}, tracker, logr.Discard())
+	collector := NewResultCollector(outputFile, errorFile, NewPendingRequests(), tracker, logr.Discard())
 
 	executor := NewJobExecutor(JobExecutorConfig{
 		Source:     &sliceSource{items: items},
@@ -99,7 +99,7 @@ func TestMetricsGateDispatcher_BudgetBelowBaseline_Cancelled(t *testing.T) {
 	outputFile := tempFile(t)
 	errorFile := tempFile(t)
 	tracker := NewProgressTracker(int64(len(items)), nil, "test-job", logr.Discard())
-	collector := NewResultCollector(outputFile, errorFile, &PendingRequests{}, tracker, logr.Discard())
+	collector := NewResultCollector(outputFile, errorFile, NewPendingRequests(), tracker, logr.Discard())
 
 	executor := NewJobExecutor(JobExecutorConfig{
 		Source:     &sliceSource{items: items},
@@ -143,7 +143,7 @@ func TestMetricsGateDispatcher_BudgetReadError_AllowsThrough(t *testing.T) {
 	outputFile := tempFile(t)
 	errorFile := tempFile(t)
 	tracker := NewProgressTracker(int64(len(items)), nil, "test-job", logr.Discard())
-	collector := NewResultCollector(outputFile, errorFile, &PendingRequests{}, tracker, logr.Discard())
+	collector := NewResultCollector(outputFile, errorFile, NewPendingRequests(), tracker, logr.Discard())
 
 	executor := NewJobExecutor(JobExecutorConfig{
 		Source:     &sliceSource{items: items},
@@ -179,7 +179,7 @@ func TestMetricsGateDispatcher_BudgetRecovery(t *testing.T) {
 	outputFile := tempFile(t)
 	errorFile := tempFile(t)
 	tracker := NewProgressTracker(int64(len(items)), nil, "test-job", logr.Discard())
-	collector := NewResultCollector(outputFile, errorFile, &PendingRequests{}, tracker, logr.Discard())
+	collector := NewResultCollector(outputFile, errorFile, NewPendingRequests(), tracker, logr.Discard())
 
 	executor := NewJobExecutor(JobExecutorConfig{
 		Source:     &sliceSource{items: items},

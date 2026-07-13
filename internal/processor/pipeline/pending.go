@@ -4,7 +4,6 @@ import (
 	"context"
 	"sync"
 	"sync/atomic"
-	"time"
 )
 
 // PendingRequests tracks in-flight requests by RequestID.
@@ -13,6 +12,11 @@ import (
 type PendingRequests struct {
 	m     sync.Map
 	count atomic.Int64
+	done  chan struct{}
+}
+
+func NewPendingRequests() *PendingRequests {
+	return &PendingRequests{done: make(chan struct{}, 1)}
 }
 
 func (p *PendingRequests) Store(msg RequestItem) {
@@ -32,8 +36,13 @@ func (p *PendingRequests) Resolve(result *ResultItem) bool {
 	if !ok {
 		return false
 	}
-	p.count.Add(-1)
-	msg := val.(RequestItem)
+	if p.count.Add(-1) == 0 {
+		close(p.done)
+	}
+	msg, ok := val.(RequestItem)
+	if !ok {
+		return false
+	}
 	result.CustomID = msg.CustomID
 	result.ModelID = msg.ModelID
 	return true
@@ -41,11 +50,11 @@ func (p *PendingRequests) Resolve(result *ResultItem) bool {
 
 // Wait blocks until all pending entries are resolved or ctx is cancelled.
 func (p *PendingRequests) Wait(ctx context.Context) {
-	for p.count.Load() > 0 {
-		select {
-		case <-ctx.Done():
-			return
-		case <-time.After(10 * time.Millisecond):
-		}
+	if p.count.Load() == 0 {
+		return
+	}
+	select {
+	case <-ctx.Done():
+	case <-p.done:
 	}
 }
