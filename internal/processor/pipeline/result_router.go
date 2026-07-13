@@ -81,9 +81,12 @@ func (b *ResultBroadcaster) Run(ctx context.Context) {
 
 			b.subscribers.Range(func(_, v any) bool {
 
-				// If we happen to be sending to a closed channel,
-				// we catch the panic(): we are unsubscribing anyway.
-				defer func() { recover() }()
+				defer func() {
+					if r := recover(); r != nil {
+						b.logger.Info("Broadcast send recovered (subscriber likely unsubscribed)",
+							"requestID", result.RequestID, "panic", r)
+					}
+				}()
 
 				ch := v.(chan<- ResultItem)
 				ch <- result
