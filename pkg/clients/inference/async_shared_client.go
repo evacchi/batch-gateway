@@ -17,8 +17,7 @@ import (
 	"github.com/llm-d-incubation/llm-d-async/producer"
 )
 
-// asyncSharedClient decouples submit from collect. Unlike asyncProducerClient,
-// it does not use the pool's resultDispatcher for per-request routing.
+// asyncSharedClient decouples submit from collect.
 // GetResult reads directly from the producer — the external ResultBroadcaster
 // handles routing to the correct job.
 type asyncSharedClient struct {

@@ -68,6 +68,8 @@ func doTestBatchCancel(t *testing.T) {
 	//   - Slow requests (max_tokens=200): take ~20s each with dev-deploy sim-model
 	//     defaults (~50ms TTFT + ~100ms inter-token), ensuring cancel arrives while
 	//     they are still in-flight or undispatched.
+	//   - 20 slow requests exceed PerModelMaxConcurrency (default 10), guaranteeing some
+	//     remain undispatched and get drained to the error file as batch_cancelled.
 	var lines []string
 	for i := 1; i <= 5; i++ {
 		lines = append(lines, fmt.Sprintf(

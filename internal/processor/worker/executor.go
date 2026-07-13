@@ -525,7 +525,7 @@ dispatch:
 }
 
 // drainAndFinalize drains undispatched entries based on termination reason and
-// returns the appropriate sentinel error. Shared by processModel and processModelAsync.
+// returns the appropriate sentinel error.
 func (p *Processor) drainAndFinalize(
 	requestAbortCtx context.Context,
 	mainCtx context.Context,
@@ -838,7 +838,7 @@ func writeResult(
 }
 
 // buildOutputLine converts an inference response and/or error into an outputLine.
-// Used by both executeOneRequest (sync path) and processModelAsync (async path).
+// Used by executeOneRequest.
 func buildOutputLine(
 	batchReqID, customID, modelID, serverRequestID string,
 	inferResp *inference.GenerateResponse,
