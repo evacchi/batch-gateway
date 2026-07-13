@@ -279,34 +279,18 @@ func (p *Processor) executeJob(ctx, sloCtx, userCancelCtx, requestAbortCtx conte
 		// This ensures the first real error reaches errCh before any context.Canceled
 		// from other models whose contexts were cancelled by requestAbortFn.
 		go func(safeModelID, modelID string) {
-			var err error
-			if p.asyncInference != nil {
-				err = p.processModelAsync(
-					requestAbortCtx,
-					ctx,
-					sloCtx,
-					userCancelCtx,
-					inputFile,
-					plansDir, safeModelID, modelID,
-					writers,
-					progress,
-					passThroughHeaders,
-					tenantID,
-				)
-			} else {
-				err = p.processModel(
-					requestAbortCtx,
-					ctx,
-					sloCtx,
-					userCancelCtx,
-					inputFile,
-					plansDir, safeModelID, modelID,
-					writers,
-					progress,
-					passThroughHeaders,
-					tenantID,
-				)
-			}
+			err = p.processModel(
+				requestAbortCtx,
+				ctx,
+				sloCtx,
+				userCancelCtx,
+				inputFile,
+				plansDir, safeModelID, modelID,
+				writers,
+				progress,
+				passThroughHeaders,
+				tenantID,
+			)
 			// Abort all sibling models when any model hits a fatal I/O error
 			// (e.g. output file write failure). modelErr is only set for local
 			// I/O failures — not inference errors, which are recorded normally
@@ -540,167 +524,8 @@ dispatch:
 		shutdownCancelled.Load())
 }
 
-// processModelAsync processes all plan entries for a single model using the
-// async submit/collect pattern. All requests are submitted to the queue first,
-// then results are collected as they arrive on a shared channel.
-func (p *Processor) processModelAsync(
-	requestAbortCtx context.Context,
-	mainCtx context.Context,
-	sloCtx context.Context,
-	userCancelCtx context.Context,
-	inputFile *os.File,
-	plansDir, safeModelID, modelID string,
-	writers *outputWriters,
-	progress *executionProgress,
-	passThroughHeaders map[string]string,
-	tenantID string,
-) error {
-	logger := logr.FromContextOrDiscard(requestAbortCtx).WithValues("model", modelID)
-	requestAbortCtx = logr.NewContext(requestAbortCtx, logger)
-
-	planPath := filepath.Join(plansDir, safeModelID+".plan")
-	entries, err := readPlanEntries(planPath)
-	if err != nil {
-		return fmt.Errorf("model setup failed: read plan for model %s: %w", modelID, err)
-	}
-
-	logger.V(logging.INFO).Info("Processing requests for model (async)", "numEntries", len(entries))
-
-	asyncClient := p.asyncInference.ClientFor(modelID)
-	if asyncClient == nil {
-		logger.V(logging.INFO).Info("No async client for model, draining as model_not_found")
-		p.drainUnprocessedRequests(
-			requestAbortCtx, inputFile, entries, writers, progress,
-			inference.ErrCodeModelNotFound)
-		return nil
-	}
-	defer func() {
-		if err := asyncClient.Close(); err != nil {
-			logger.Error(err, "Failed to close async client")
-		}
-	}()
-
-	// ── Phase 1: Submit ────────────────────────────────────────────────────
-	type pendingRequest struct {
-		batchReqID string
-		customID   string
-	}
-
-	pending := make(map[string]*pendingRequest)
-	var submitCount int
-
-	for _, entry := range entries {
-		if requestAbortCtx.Err() != nil {
-			logger.V(logging.INFO).Info("Async submit aborted", "submitted", len(pending), "total", len(entries), "reason", requestAbortCtx.Err())
-			break
-		}
-
-		req, batchReqID, parseErr, readErr := readRequestLine(inputFile, entry, logger)
-		if readErr != nil {
-			return readErr
-		}
-		if parseErr != nil {
-			lineBytes, err := json.Marshal(parseErr)
-			if err != nil {
-				return fmt.Errorf("marshal parse error line: %w", err)
-			}
-			lineBytes = append(lineBytes, '\n')
-			if err := writers.write(lineBytes, true); err != nil {
-				return fmt.Errorf("write parse error line: %w", err)
-			}
-			progress.record(requestAbortCtx, false)
-			submitCount++
-			continue
-		}
-
-		if errors.Is(sloCtx.Err(), context.DeadlineExceeded) {
-			break
-		}
-
-		headers := maps.Clone(passThroughHeaders)
-		headers = mergeInferenceHeaders(headers, sloCtx, p.cfg.InferenceObjectiveFor(modelID), p.fairnessID(tenantID))
-
-		inferReq := &inference.GenerateRequest{
-			RequestID: batchReqID,
-			Endpoint:  req.URL,
-			Params:    req.Body,
-			Headers:   headers,
-		}
-
-		if submitErr := asyncClient.Submit(requestAbortCtx, inferReq); submitErr != nil {
-			out := newErrorOutputLine(batchReqID, req.CustomID,
-				string(submitErr.Category), submitErr.Message)
-			lineBytes, err := json.Marshal(out)
-			if err != nil {
-				return fmt.Errorf("marshal submit error line: %w", err)
-			}
-			lineBytes = append(lineBytes, '\n')
-			if err := writers.write(lineBytes, true); err != nil {
-				return fmt.Errorf("write submit error line: %w", err)
-			}
-			progress.record(requestAbortCtx, false)
-			submitCount++
-			continue
-		}
-
-		pending[batchReqID] = &pendingRequest{
-			batchReqID: batchReqID,
-			customID:   req.CustomID,
-		}
-		submitCount++
-	}
-
-	logger.V(logging.INFO).Info("Submit phase complete", "submitted", len(pending), "total", submitCount)
-
-	// ── Phase 2: Collect ───────────────────────────────────────────────────
-	var modelErr error
-
-	for len(pending) > 0 {
-		resp, err := asyncClient.GetResult(requestAbortCtx)
-		if err != nil {
-			if requestAbortCtx.Err() == nil {
-				logger.Error(err, "Failed to collect async result", "pendingCount", len(pending))
-				modelErr = fmt.Errorf("async result collection failed: %w", err)
-			}
-			break
-		}
-
-		pr, ok := pending[resp.RequestID]
-		if !ok {
-			logger.V(logging.TRACE).Info("Ignoring result for unknown request", "requestID", resp.RequestID)
-			continue
-		}
-
-		out := buildOutputLine(pr.batchReqID, pr.customID, modelID, resp.RequestID, resp, nil, logger)
-		if err := writeResult(out, sloCtx, userCancelCtx, requestAbortCtx, writers, progress); err != nil {
-			modelErr = err
-			break
-		}
-		delete(pending, resp.RequestID)
-	}
-
-	// Drain submitted-but-uncollected requests as errors so that
-	// output_lines + error_lines == total_requests.
-	for _, pr := range pending {
-		out := newErrorOutputLine(pr.batchReqID, pr.customID,
-			string(batch_types.ErrCodeBatchExpired), "result not collected before deadline")
-		lineBytes, err := json.Marshal(out)
-		if err != nil {
-			return fmt.Errorf("marshal uncollected error line: %w", err)
-		}
-		lineBytes = append(lineBytes, '\n')
-		if err := writers.write(lineBytes, true); err != nil {
-			return fmt.Errorf("write uncollected error line: %w", err)
-		}
-		progress.record(requestAbortCtx, false)
-	}
-
-	return p.drainAndFinalize(requestAbortCtx, mainCtx, sloCtx, userCancelCtx,
-		inputFile, entries[submitCount:], writers, progress, modelErr, logger, len(entries), 0)
-}
-
 // drainAndFinalize drains undispatched entries based on termination reason and
-// returns the appropriate sentinel error. Shared by processModel and processModelAsync.
+// returns the appropriate sentinel error.
 func (p *Processor) drainAndFinalize(
 	requestAbortCtx context.Context,
 	mainCtx context.Context,
@@ -1013,7 +838,7 @@ func writeResult(
 }
 
 // buildOutputLine converts an inference response and/or error into an outputLine.
-// Used by both executeOneRequest (sync path) and processModelAsync (async path).
+// Used by executeOneRequest.
 func buildOutputLine(
 	batchReqID, customID, modelID, serverRequestID string,
 	inferResp *inference.GenerateResponse,
