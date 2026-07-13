@@ -84,7 +84,7 @@ func (r *AsyncGatewayResolver) SharedClientFor(modelID string) AsyncInferenceCli
 	if r.sharedClients == nil {
 		r.sharedClients = make(map[string]*asyncSharedClient)
 	}
-	c := newAsyncSharedClient(pool, defaultResultBufferSize, r.logger.WithValues("model", modelID))
+	c := newAsyncSharedClient(pool.producer, pool.dispatcher.pollTimeout, r.logger.WithValues("model", modelID))
 	r.sharedClients[modelID] = c
 	return c
 }
@@ -162,5 +162,5 @@ func NewAsyncResolver(config AsyncClientConfig, logger logr.Logger) (*AsyncGatew
 
 	closers = append(closers, rdb)
 
-	return &AsyncGatewayResolver{pools: pools, closers: closers}, nil
+	return &AsyncGatewayResolver{pools: pools, closers: closers, logger: logger}, nil
 }
