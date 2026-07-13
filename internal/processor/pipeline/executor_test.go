@@ -207,7 +207,7 @@ func TestJobExecutorMultipleModels(t *testing.T) {
 		"m1": &mockInferenceClient{response: respBytes},
 		"m2": &mockInferenceClient{response: respBytes},
 	})
-	defer resolver.Close()
+	defer func() { _ = resolver.Close() }()
 
 	items := []RequestItem{
 		{RequestID: "req-1", CustomID: "a", ModelID: "m1", Endpoint: "/v1/chat/completions"},
@@ -271,7 +271,7 @@ func TestJobExecutorMultipleModels_ModelNotFound(t *testing.T) {
 	resolver := inference.NewPerModelClientResolver(map[string]inference.InferenceClient{
 		"m1": &mockInferenceClient{response: []byte(`{"ok":true}`)},
 	})
-	defer resolver.Close()
+	defer func() { _ = resolver.Close() }()
 
 	items := []RequestItem{
 		{RequestID: "req-1", CustomID: "a", ModelID: "m1", Endpoint: "/v1/chat/completions"},
