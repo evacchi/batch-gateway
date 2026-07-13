@@ -8,7 +8,6 @@ import (
 
 	"github.com/go-logr/logr"
 
-	batch_types "github.com/llm-d/llm-d-batch-gateway/internal/shared/types"
 	httpclient "github.com/llm-d/llm-d-batch-gateway/pkg/clients/http"
 	"github.com/llm-d/llm-d-batch-gateway/pkg/clients/inference"
 )
@@ -58,7 +57,7 @@ func TestJobExecutorEndToEnd(t *testing.T) {
 
 	executor := NewJobExecutor(JobExecutorConfig{
 		Source:     &sliceSource{items: items},
-		Dispatcher: newTestSyncDispatcher(resolver),
+		Dispatcher: NewDirectDispatcher(resolver, logr.Discard()),
 		Collector:  collector,
 		Tracker:    tracker,
 		Logger:     logr.Discard(),
@@ -122,7 +121,7 @@ func TestJobExecutorWithErrors(t *testing.T) {
 
 	executor := NewJobExecutor(JobExecutorConfig{
 		Source:     &sliceSource{items: items},
-		Dispatcher: newTestSyncDispatcher(resolver),
+		Dispatcher: NewDirectDispatcher(resolver, logr.Discard()),
 		Collector:  collector,
 		Tracker:    tracker,
 		Logger:     logr.Discard(),
@@ -173,7 +172,7 @@ func TestJobExecutorCancellation(t *testing.T) {
 
 	executor := NewJobExecutor(JobExecutorConfig{
 		Source:     source,
-		Dispatcher: newTestSyncDispatcher(resolver),
+		Dispatcher: NewDirectDispatcher(resolver, logr.Discard()),
 		Collector:  collector,
 		Tracker:    tracker,
 		Logger:     logr.Discard(),
@@ -225,7 +224,7 @@ func TestJobExecutorMultipleModels(t *testing.T) {
 
 	executor := NewJobExecutor(JobExecutorConfig{
 		Source:     &sliceSource{items: items},
-		Dispatcher: newTestSyncDispatcher(resolver),
+		Dispatcher: NewDirectDispatcher(resolver, logr.Discard()),
 		Collector:  collector,
 		Tracker:    tracker,
 		Logger:     logr.Discard(),
@@ -288,7 +287,7 @@ func TestJobExecutorMultipleModels_ModelNotFound(t *testing.T) {
 
 	executor := NewJobExecutor(JobExecutorConfig{
 		Source:     &sliceSource{items: items},
-		Dispatcher: newTestSyncDispatcher(resolver),
+		Dispatcher: NewDirectDispatcher(resolver, logr.Discard()),
 		Collector:  collector,
 		Tracker:    tracker,
 		Logger:     logr.Discard(),
@@ -357,7 +356,7 @@ func TestJobExecutorSeparatesSuccessAndErrors(t *testing.T) {
 
 	executor := NewJobExecutor(JobExecutorConfig{
 		Source:     &sliceSource{items: items},
-		Dispatcher: newTestSyncDispatcher(resolver),
+		Dispatcher: NewDirectDispatcher(resolver, logr.Discard()),
 		Collector:  collector,
 		Tracker:    tracker,
 		Logger:     logr.Discard(),
@@ -438,7 +437,7 @@ func TestJobExecutorHTTPErrorGoesToOutputFile(t *testing.T) {
 
 	executor := NewJobExecutor(JobExecutorConfig{
 		Source:     &sliceSource{items: items},
-		Dispatcher: newTestSyncDispatcher(resolver),
+		Dispatcher: NewDirectDispatcher(resolver, logr.Discard()),
 		Collector:  collector,
 		Tracker:    tracker,
 		Logger:     logr.Discard(),
@@ -526,53 +525,3 @@ func (m *mockInferenceClientForE2E) Generate(ctx context.Context, req *inference
 var _ inference.InferenceClient = (*mockInferenceClient)(nil)
 var _ inference.InferenceClient = (*mockInferenceClientForE2E)(nil)
 var _ RequestSource = (*sliceSource)(nil)
-var _ RequestDispatcher = (*testSyncDispatcher)(nil)
-
-// testSyncDispatcher is a minimal synchronous dispatcher for executor tests.
-// It calls Generate inline (no concurrency) and converts the result.
-type testSyncDispatcher struct {
-	resolver *inference.GatewayResolver
-}
-
-func newTestSyncDispatcher(resolver *inference.GatewayResolver) *testSyncDispatcher {
-	return &testSyncDispatcher{resolver: resolver}
-}
-
-func (d *testSyncDispatcher) Run(_ context.Context, requestCh <-chan RequestItem, resultCh chan<- ResultItem) error {
-	for msg := range requestCh {
-		client := d.resolver.ClientFor(msg.ModelID)
-		if client == nil {
-			resultCh <- *msg.ModelNotFound()
-			continue
-		}
-		req := &inference.GenerateRequest{
-			RequestID: msg.RequestID,
-			Endpoint:  msg.Endpoint,
-			Params:    msg.Body,
-			Headers:   msg.Headers,
-		}
-		resp, clientErr := client.Generate(context.Background(), req)
-		result := ResultItem{RequestID: msg.RequestID, CustomID: msg.CustomID, ModelID: msg.ModelID}
-		switch {
-		case clientErr != nil && clientErr.StatusCode > 0:
-			body := make(map[string]any)
-			if len(clientErr.ResponseBody) > 0 {
-				_ = json.Unmarshal(clientErr.ResponseBody, &body)
-			}
-			result.Response = &batch_types.ResponseData{StatusCode: clientErr.StatusCode, RequestID: msg.RequestID, Body: body}
-		case clientErr != nil:
-			result.Error = &OutputError{Code: string(clientErr.Category), Message: clientErr.Message}
-		case resp == nil:
-			result.Error = &OutputError{Code: string(httpclient.ErrCategoryServer), Message: "nil response"}
-		default:
-			var body map[string]any
-			if len(resp.Response) > 0 {
-				_ = json.Unmarshal(resp.Response, &body)
-			}
-			result.Response = &batch_types.ResponseData{StatusCode: 200, RequestID: resp.RequestID, Body: body}
-		}
-		resultCh <- result
-	}
-	close(resultCh)
-	return nil
-}

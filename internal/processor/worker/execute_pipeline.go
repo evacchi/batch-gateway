@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/go-logr/logr"
+	"github.com/llm-d/llm-d-batch-gateway/pkg/clients/inference"
 
 	"github.com/llm-d/llm-d-batch-gateway/internal/processor/pipeline"
 	"github.com/llm-d/llm-d-batch-gateway/internal/shared/openai"
@@ -121,8 +122,19 @@ func (p *Processor) executeJobAsync(ctx, sloCtx, userCancelCtx, requestAbortCtx 
 }
 
 func (p *Processor) resolveRequestDispatcher(modelMap *modelMapFile, pending *pipeline.PendingRequests, logger logr.Logger) pipeline.RequestDispatcher {
-	broadcasters := p.broadcasters.forModels(modelMap)
-	return pipeline.NewAsyncDispatcher(p.asyncInference, broadcasters, pending, logger)
+	var dispatcher pipeline.RequestDispatcher
+
+	if p.asyncInference != nil {
+		broadcasters := p.broadcasters.forModels(modelMap)
+		dispatcher = pipeline.NewAsyncDispatcher(p.asyncInference, broadcasters, pending, logger)
+	} else {
+		dispatcher = pipeline.NewDirectDispatcher(p.inference, logger)
+		if p.cfg.Concurrency.AIMD.Enabled {
+			models := buildAIMDModels(modelMap, p.inference, p.endpointLimits)
+			dispatcher = pipeline.NewAIMDDispatcher(dispatcher, models, p.cfg.Concurrency.Global, logger)
+		}
+	}
+	return dispatcher
 }
 
 func logPassThroughHeaders(params *jobExecutionParams, logger logr.Logger) {
@@ -186,4 +198,24 @@ func (p *Processor) openDataFiles(params *jobExecutionParams) (*dataFiles, error
 	}
 
 	return &dataFiles{input: inputFile, output: outputFile, error: errorFile}, nil
+}
+
+func buildAIMDModels(modelMap *modelMapFile, resolver *inference.GatewayResolver, endpointLimits map[inference.InferenceClient]*endpointLimit) map[string]*pipeline.EndpointAIMD {
+	models := make(map[string]*pipeline.EndpointAIMD)
+	for _, modelID := range modelMap.SafeToModel {
+		client := resolver.ClientFor(modelID)
+		if client == nil {
+			continue
+		}
+		ep := endpointLimits[client]
+		if ep == nil || ep.aimd == nil {
+			continue
+		}
+		models[modelID] = &pipeline.EndpointAIMD{
+			Sem:   ep.sem,
+			AIMD:  ep.aimd,
+			Label: ep.label,
+		}
+	}
+	return models
 }

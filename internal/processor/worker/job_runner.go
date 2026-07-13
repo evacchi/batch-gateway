@@ -196,11 +196,7 @@ func (p *Processor) runJob(ctx context.Context, params *jobExecutionParams) {
 
 	// execution: execute inference requests
 	var execErr error
-	if p.asyncInference != nil {
-		requestCounts, execErr = p.executeJobAsync(ctx, sloCtx, userCancelCtx, requestAbortCtx, params)
-	} else {
-		requestCounts, execErr = p.executeJob(ctx, sloCtx, userCancelCtx, requestAbortCtx, params)
-	}
+	requestCounts, execErr = p.executeJobAsync(ctx, sloCtx, userCancelCtx, requestAbortCtx, params)
 	params.requestCounts = requestCounts
 	if execErr != nil {
 		// errExpired, errCancelled, and errShutdown are expected terminal states, not system errors.
