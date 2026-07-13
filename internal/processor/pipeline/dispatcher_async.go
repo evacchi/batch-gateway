@@ -43,6 +43,8 @@ func (d *AsyncDispatcher) Run(ctx context.Context, requestCh <-chan RequestItem,
 		for _, b := range d.broadcasters {
 			b.Unsubscribe(resultCh)
 		}
+		// Defers unsubscribe from broadcasters — no more writes to resultCh.
+		close(resultCh)
 	}()
 
 	// Submit phase — fast queue writes.
@@ -85,7 +87,5 @@ func (d *AsyncDispatcher) Run(ctx context.Context, requestCh <-chan RequestItem,
 	// Wait for all pending results to be resolved by the collector.
 	d.pending.Wait(ctx)
 
-	// Defers unsubscribe from broadcasters — no more writes to resultCh.
-	close(resultCh)
 	return nil
 }

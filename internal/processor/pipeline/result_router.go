@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sync"
 
 	"github.com/go-logr/logr"
 
@@ -13,40 +14,35 @@ import (
 
 const defaultResultBuffer = 64
 
-// ResultBroadcaster reads results from a shared async queue and
-// broadcasts to all subscribed channels. Actor pattern — single
-// goroutine owns the subscriber list, subscribe/unsubscribe via channels.
+// ResultBroadcaster reads results from a shared async client and
+// broadcasts to all subscribed channels.
 type ResultBroadcaster struct {
-	client        inference.AsyncInferenceClient
-	subscribeCh   chan chan<- ResultItem
-	unsubscribeCh chan chan<- ResultItem
-	logger        logr.Logger
+	client      inference.AsyncInferenceClient
+	subscribers sync.Map
+	logger      logr.Logger
 }
 
 func NewResultBroadcaster(client inference.AsyncInferenceClient, logger logr.Logger) *ResultBroadcaster {
 	return &ResultBroadcaster{
-		client:        client,
-		subscribeCh:   make(chan chan<- ResultItem),
-		unsubscribeCh: make(chan chan<- ResultItem),
-		logger:        logger,
+		client:      client,
+		subscribers: sync.Map{},
+		logger:      logger,
 	}
 }
 
 // Subscribe registers dest to receive all results.
 // dest should be buffered to avoid blocking the broadcaster.
 func (b *ResultBroadcaster) Subscribe(dest chan<- ResultItem) {
-	b.subscribeCh <- dest
+	b.subscribers.Store(dest, dest)
 }
 
 // Unsubscribe removes dest from the broadcast list.
 func (b *ResultBroadcaster) Unsubscribe(dest chan<- ResultItem) {
-	b.unsubscribeCh <- dest
+	b.subscribers.Delete(dest)
 }
 
 // Run reads results and broadcasts to all subscribers.
 func (b *ResultBroadcaster) Run(ctx context.Context) {
-	var subscribers []chan<- ResultItem
-
 	type resultMsg struct {
 		resp *inference.GenerateResponse
 		err  error
@@ -73,17 +69,6 @@ func (b *ResultBroadcaster) Run(ctx context.Context) {
 		case <-ctx.Done():
 			return
 
-		case dest := <-b.subscribeCh:
-			subscribers = append(subscribers, dest)
-
-		case dest := <-b.unsubscribeCh:
-			for i, ch := range subscribers {
-				if ch == dest {
-					subscribers = append(subscribers[:i], subscribers[i+1:]...)
-					break
-				}
-			}
-
 		case msg, ok := <-incomingCh:
 			if !ok {
 				return
@@ -93,9 +78,18 @@ func (b *ResultBroadcaster) Run(ctx context.Context) {
 				return
 			}
 			result := asyncResult(msg.resp, b.logger)
-			for _, ch := range subscribers {
+
+			b.subscribers.Range(func(_, v any) bool {
+
+				// If we happen to be sending to a closed channel,
+				// we catch the panic(): we are unsubscribing anyway.
+				defer func() { recover() }()
+
+				ch := v.(chan<- ResultItem)
 				ch <- result
-			}
+
+				return true
+			})
 		}
 	}
 }
