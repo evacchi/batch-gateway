@@ -25,19 +25,19 @@ import (
 	"path/filepath"
 )
 
-const PlanEntrySize = 16 // 8 bytes offset + 4 bytes length + 4 bytes prefixHash
+const planEntrySize = 16 // 8 bytes offset + 4 bytes length + 4 bytes prefixHash
 
-// unmarshalPlanEntry decodes a 16-byte little-endian buffer into a PlanEntry.
-func unmarshalPlanEntry(buf [PlanEntrySize]byte) PlanEntry {
-	return PlanEntry{
+// unmarshalPlanEntry decodes a 16-byte little-endian buffer into a planEntry.
+func unmarshalPlanEntry(buf [planEntrySize]byte) planEntry {
+	return planEntry{
 		Offset:     int64(binary.LittleEndian.Uint64(buf[0:8])),
 		Length:     binary.LittleEndian.Uint32(buf[8:12]),
 		PrefixHash: binary.LittleEndian.Uint32(buf[12:16]),
 	}
 }
 
-// ReadPlanEntries reads all plan entries from a finalized plan file.
-func ReadPlanEntries(planFilePath string) ([]PlanEntry, error) {
+// readPlanEntries reads all plan entries from a finalized plan file.
+func readPlanEntries(planFilePath string) ([]planEntry, error) {
 	f, err := os.Open(planFilePath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open plan file %s: %w", planFilePath, err)
@@ -49,15 +49,15 @@ func ReadPlanEntries(planFilePath string) ([]PlanEntry, error) {
 		return nil, fmt.Errorf("failed to stat plan file: %w", err)
 	}
 
-	// check if the plan file size is a multiple of PlanEntrySize
-	if info.Size()%PlanEntrySize != 0 {
-		return nil, fmt.Errorf("plan file size %d is not a multiple of %d", info.Size(), PlanEntrySize)
+	// check if the plan file size is a multiple of planEntrySize
+	if info.Size()%planEntrySize != 0 {
+		return nil, fmt.Errorf("plan file size %d is not a multiple of %d", info.Size(), planEntrySize)
 	}
 
-	numEntries := int(info.Size() / PlanEntrySize)
-	entries := make([]PlanEntry, 0, numEntries)
+	numEntries := int(info.Size() / planEntrySize)
+	entries := make([]planEntry, 0, numEntries)
 
-	var buffer [PlanEntrySize]byte
+	var buffer [planEntrySize]byte
 	for {
 		_, err := io.ReadFull(f, buffer[:])
 		if err == io.EOF {
@@ -72,15 +72,15 @@ func ReadPlanEntries(planFilePath string) ([]PlanEntry, error) {
 	return entries, nil
 }
 
-// ReadModelMap reads the model_map.json file from the job root directory.
-func ReadModelMap(jobRootDir string) (*ModelMapFile, error) {
-	path := filepath.Join(jobRootDir, ModelMapFileName)
+// readModelMap reads the model_map.json file from the job root directory.
+func readModelMap(jobRootDir string) (*modelMapFile, error) {
+	path := filepath.Join(jobRootDir, modelMapFileName)
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read model map file: %w", err)
 	}
 
-	var mm ModelMapFile
+	var mm modelMapFile
 	if err := json.Unmarshal(data, &mm); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal model map file: %w", err)
 	}

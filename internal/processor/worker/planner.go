@@ -28,7 +28,7 @@ import (
 	"sort"
 )
 
-const ModelMapFileName = "model_map.json"
+const modelMapFileName = "model_map.json"
 
 type planRequestLine struct {
 	CustomID string `json:"custom_id"`
@@ -49,20 +49,20 @@ type planRequestLine struct {
 // requests with actual system prompts to be dispatched first.
 const NoPrefixHash uint32 = math.MaxUint32
 
-// PlanEntry is a single entry in the plan file.
+// planEntry is a single entry in the plan file.
 // 16 bytes:
 // Offset [int64 Offset] start byte offset of the request line in input.jsonl
 // Length [uint32 Length] length of the request line in input.jsonl
 // PrefixHash [uint32 PrefixHash] FNV-32a hash of the request's system prompt, used to group similar requests together during execution. If the system prompt is absent, the hash defaults to NoPrefixHash.
-type PlanEntry struct {
+type planEntry struct {
 	Offset     int64
 	Length     uint32
 	PrefixHash uint32
 }
 
 // marshalBinary encodes the entry into a fixed-size 16-byte little-endian buffer.
-func (e PlanEntry) marshalBinary() [PlanEntrySize]byte {
-	var buf [PlanEntrySize]byte
+func (e planEntry) marshalBinary() [planEntrySize]byte {
+	var buf [planEntrySize]byte
 	binary.LittleEndian.PutUint64(buf[0:8], uint64(e.Offset))
 	binary.LittleEndian.PutUint32(buf[8:12], e.Length)
 	binary.LittleEndian.PutUint32(buf[12:16], e.PrefixHash)
@@ -73,33 +73,33 @@ func (e PlanEntry) marshalBinary() [PlanEntrySize]byte {
 // Once all entries are collected, Finalize sorts each model's entries by PrefixHash and writes them to disk.
 type planAccumulator struct {
 	jobRootDir string
-	entries    map[string][]PlanEntry // safeModelID -> entries
+	entries    map[string][]planEntry // safeModelID -> entries
 }
 
 func newPlanAccumulator(jobRootDir string) *planAccumulator {
 	return &planAccumulator{
 		jobRootDir: jobRootDir,
-		entries:    make(map[string][]PlanEntry),
+		entries:    make(map[string][]planEntry),
 	}
 }
 
-// ModelMapFile is a map of modelID to the file name of the plan file
-type ModelMapFile struct {
+// modelMapFile is a map of modelID to the file name of the plan file
+type modelMapFile struct {
 	ModelToSafe   map[string]string `json:"model_to_safe"`
 	SafeToModel   map[string]string `json:"safe_to_model"`
 	LineCount     int64             `json:"line_count"`
 	RejectedCount int64             `json:"rejected_count"`
 }
 
-func writeModelMapFile(jobRootDir string, ModelMapFile ModelMapFile) error {
-	finalPath := filepath.Join(jobRootDir, ModelMapFileName)
+func writeModelMapFile(jobRootDir string, modelMapFile modelMapFile) error {
+	finalPath := filepath.Join(jobRootDir, modelMapFileName)
 	tempPath := finalPath + ".tmp"
 
 	if err := os.MkdirAll(jobRootDir, 0o700); err != nil {
 		return fmt.Errorf("failed to create job root directory: %w", err)
 	}
 
-	data, err := json.MarshalIndent(ModelMapFile, "", "  ") // indent for manual inspection
+	data, err := json.MarshalIndent(modelMapFile, "", "  ") // indent for manual inspection
 	if err != nil {
 		return fmt.Errorf("failed to marshal model map file: %w", err)
 	}
@@ -125,7 +125,7 @@ func (a *planAccumulator) plansDir() string {
 	return filepath.Join(a.jobRootDir, "plans")
 }
 
-func (a *planAccumulator) Append(safeModelID string, entry PlanEntry) {
+func (a *planAccumulator) Append(safeModelID string, entry planEntry) {
 	a.entries[safeModelID] = append(a.entries[safeModelID], entry)
 }
 
@@ -211,7 +211,7 @@ func accumulatePlanEntry(
 		modelToSafe[modelID] = safeModelID
 	}
 
-	acc.Append(safeModelID, PlanEntry{Offset: offset, Length: length, PrefixHash: prefixHash})
+	acc.Append(safeModelID, planEntry{Offset: offset, Length: length, PrefixHash: prefixHash})
 	return offset + int64(length)
 }
 

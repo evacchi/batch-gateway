@@ -58,8 +58,8 @@ func TestPlanAccumulator_AppendAndFinalize_WritesLittleEndian16Bytes(t *testing.
 	acc := newPlanAccumulator(root)
 
 	model := "m1"
-	e1 := PlanEntry{Offset: 123, Length: 456, PrefixHash: 99}
-	e2 := PlanEntry{Offset: 999999, Length: 1, PrefixHash: 42}
+	e1 := planEntry{Offset: 123, Length: 456, PrefixHash: 99}
+	e2 := planEntry{Offset: 999999, Length: 1, PrefixHash: 42}
 
 	acc.Append(model, e1)
 	acc.Append(model, e2)
@@ -77,9 +77,9 @@ func TestPlanAccumulator_AppendAndFinalize_WritesLittleEndian16Bytes(t *testing.
 		t.Fatalf("len=%d want 32", len(b))
 	}
 
-	readEntry := func(off int) PlanEntry {
-		var buf [PlanEntrySize]byte
-		copy(buf[:], b[off:off+PlanEntrySize])
+	readEntry := func(off int) planEntry {
+		var buf [planEntrySize]byte
+		copy(buf[:], b[off:off+planEntrySize])
 		return unmarshalPlanEntry(buf)
 	}
 
@@ -98,9 +98,9 @@ func TestPlanAccumulator_MultipleModels_Finalize(t *testing.T) {
 	root := t.TempDir()
 	acc := newPlanAccumulator(root)
 
-	acc.Append("a", PlanEntry{Offset: 0, Length: 10, PrefixHash: 5})
-	acc.Append("b", PlanEntry{Offset: 10, Length: 20, PrefixHash: 3})
-	acc.Append("a", PlanEntry{Offset: 30, Length: 40, PrefixHash: 1})
+	acc.Append("a", planEntry{Offset: 0, Length: 10, PrefixHash: 5})
+	acc.Append("b", planEntry{Offset: 10, Length: 20, PrefixHash: 3})
+	acc.Append("a", planEntry{Offset: 30, Length: 40, PrefixHash: 1})
 
 	if err := acc.Finalize([]string{"a", "b", "missing"}); err != nil {
 		t.Fatalf("Finalize: %v", err)
@@ -123,9 +123,9 @@ func TestPlanAccumulator_MultipleModels_Finalize(t *testing.T) {
 	}
 
 	// verify model "a" entries are sorted by PrefixHash
-	entries, err := ReadPlanEntries(filepath.Join(root, "plans", "a.plan"))
+	entries, err := readPlanEntries(filepath.Join(root, "plans", "a.plan"))
 	if err != nil {
-		t.Fatalf("ReadPlanEntries: %v", err)
+		t.Fatalf("readPlanEntries: %v", err)
 	}
 	if len(entries) != 2 {
 		t.Fatalf("entries=%d want 2", len(entries))
@@ -137,7 +137,7 @@ func TestPlanAccumulator_MultipleModels_Finalize(t *testing.T) {
 
 func TestWriteModelMapFile_AtomicWrite(t *testing.T) {
 	root := t.TempDir()
-	m := ModelMapFile{
+	m := modelMapFile{
 		ModelToSafe: map[string]string{"m": "m_safe"},
 		SafeToModel: map[string]string{"m_safe": "m"},
 		LineCount:   123,
@@ -147,7 +147,7 @@ func TestWriteModelMapFile_AtomicWrite(t *testing.T) {
 		t.Fatalf("writeModelMapFile: %v", err)
 	}
 
-	finalPath := filepath.Join(root, ModelMapFileName)
+	finalPath := filepath.Join(root, modelMapFileName)
 	tmpPath := finalPath + ".tmp"
 
 	if _, err := os.Stat(tmpPath); err == nil {
@@ -159,7 +159,7 @@ func TestWriteModelMapFile_AtomicWrite(t *testing.T) {
 		t.Fatalf("ReadFile: %v", err)
 	}
 
-	var got ModelMapFile
+	var got modelMapFile
 	if err := json.Unmarshal(b, &got); err != nil {
 		t.Fatalf("Unmarshal: %v", err)
 	}
@@ -176,7 +176,7 @@ func TestWriteModelMapFile_AtomicWrite(t *testing.T) {
 }
 
 func TestReadPlanEntries_NonexistentFile(t *testing.T) {
-	_, err := ReadPlanEntries(filepath.Join(t.TempDir(), "nonexistent.plan"))
+	_, err := readPlanEntries(filepath.Join(t.TempDir(), "nonexistent.plan"))
 	if err == nil {
 		t.Fatalf("expected error for nonexistent file")
 	}
@@ -184,12 +184,12 @@ func TestReadPlanEntries_NonexistentFile(t *testing.T) {
 
 func TestReadPlanEntries_TruncatedFile(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "truncated.plan")
-	if err := os.WriteFile(path, make([]byte, PlanEntrySize+3), 0o600); err != nil {
+	if err := os.WriteFile(path, make([]byte, planEntrySize+3), 0o600); err != nil {
 		t.Fatalf("WriteFile: %v", err)
 	}
-	_, err := ReadPlanEntries(path)
+	_, err := readPlanEntries(path)
 	if err == nil {
-		t.Fatalf("expected error for file size not multiple of PlanEntrySize")
+		t.Fatalf("expected error for file size not multiple of planEntrySize")
 	}
 }
 
@@ -198,7 +198,7 @@ func TestReadPlanEntries_EmptyFile(t *testing.T) {
 	if err := os.WriteFile(path, nil, 0o600); err != nil {
 		t.Fatalf("WriteFile: %v", err)
 	}
-	entries, err := ReadPlanEntries(path)
+	entries, err := readPlanEntries(path)
 	if err != nil {
 		t.Fatalf("unexpected error for empty file: %v", err)
 	}

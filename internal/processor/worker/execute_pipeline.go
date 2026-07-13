@@ -2,7 +2,6 @@ package worker
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"os"
 	"time"
@@ -24,7 +23,7 @@ func (p *Processor) executeJobAsync(ctx, sloCtx, userCancelCtx, requestAbortCtx 
 		return nil, fmt.Errorf("resolve job root directory: %w", err)
 	}
 
-	modelMap, err := readModelMapForPipeline(jobRootDir)
+	modelMap, err := readModelMap(jobRootDir)
 	if err != nil {
 		return nil, fmt.Errorf("read model map: %w", err)
 	}
@@ -65,7 +64,7 @@ func (p *Processor) executeJobAsync(ctx, sloCtx, userCancelCtx, requestAbortCtx 
 	)
 	tracker.AddFailed(modelMap.RejectedCount)
 
-	source := pipeline.NewPlanFileSource(pipeline.PlanFileSourceConfig{
+	source := NewPlanFileSource(PlanFileSourceConfig{
 		InputFile:          files.input,
 		PlansDir:           plansDir,
 		ModelMap:           modelMap,
@@ -122,7 +121,7 @@ func (p *Processor) executeJobAsync(ctx, sloCtx, userCancelCtx, requestAbortCtx 
 	return counts, nil
 }
 
-func (p *Processor) resolveRequestDispatcher(modelMap *pipeline.ModelMap, pending *pipeline.PendingRequests, logger logr.Logger) pipeline.RequestDispatcher {
+func (p *Processor) resolveRequestDispatcher(modelMap *modelMapFile, pending *pipeline.PendingRequests, logger logr.Logger) pipeline.RequestDispatcher {
 	var dispatcher pipeline.RequestDispatcher
 
 	if p.asyncInference != nil {
@@ -201,7 +200,7 @@ func (p *Processor) openDataFiles(params *jobExecutionParams) (*dataFiles, error
 	return &dataFiles{input: inputFile, output: outputFile, error: errorFile}, nil
 }
 
-func buildAIMDModels(modelMap *pipeline.ModelMap, resolver *inference.GatewayResolver, endpointLimits map[inference.InferenceClient]*endpointLimit) map[string]*pipeline.EndpointAIMD {
+func buildAIMDModels(modelMap *modelMapFile, resolver *inference.GatewayResolver, endpointLimits map[inference.InferenceClient]*endpointLimit) map[string]*pipeline.EndpointAIMD {
 	models := make(map[string]*pipeline.EndpointAIMD)
 	for _, modelID := range modelMap.SafeToModel {
 		client := resolver.ClientFor(modelID)
@@ -219,17 +218,4 @@ func buildAIMDModels(modelMap *pipeline.ModelMap, resolver *inference.GatewayRes
 		}
 	}
 	return models
-}
-
-func readModelMapForPipeline(jobRootDir string) (*pipeline.ModelMap, error) {
-	path := fmt.Sprintf("%s/%s", jobRootDir, ModelMapFileName)
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, fmt.Errorf("read model map file: %w", err)
-	}
-	var mm pipeline.ModelMap
-	if err := json.Unmarshal(data, &mm); err != nil {
-		return nil, fmt.Errorf("unmarshal model map file: %w", err)
-	}
-	return &mm, nil
 }

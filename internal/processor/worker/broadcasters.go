@@ -36,7 +36,7 @@ func (r *broadcasterRegistry) stop() {
 	r.cancel()
 }
 
-func (r *broadcasterRegistry) forModels(modelMap *pipeline.ModelMap) map[string]*pipeline.ResultBroadcaster {
+func (r *broadcasterRegistry) forModels(modelMap *modelMapFile) map[string]*pipeline.ResultBroadcaster {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 

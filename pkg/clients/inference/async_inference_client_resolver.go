@@ -42,9 +42,9 @@ type AsyncClientConfig struct {
 // backed by a shared producer and dispatcher per pool.
 // Immutable after construction — safe for concurrent reads.
 type AsyncGatewayResolver struct {
-	pools         map[string]*asyncPool // model → pool
-	sharedClients sync.Map              // model → *asyncSharedClient
-	closers       []io.Closer
+	pools           map[string]*asyncPool // model → pool
+	sharedClients   sync.Map              // model → *asyncSharedClient
+	closers         []io.Closer
 	clientFactories map[string]func() AsyncInferenceClient // test-only override
 	logger          logr.Logger
 }

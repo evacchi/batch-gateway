@@ -312,7 +312,7 @@ func writeModelMappings(jobRootDir string, modelToSafe map[string]string, lineCo
 		safeToModel[safeID] = modelID
 	}
 
-	modelMap := ModelMapFile{
+	modelMap := modelMapFile{
 		ModelToSafe:   modelToSafe,
 		SafeToModel:   safeToModel,
 		LineCount:     lineCount,

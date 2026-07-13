@@ -124,12 +124,12 @@ func TestPreProcess_BuildsPlansAndModelMap_OffsetsCorrect(t *testing.T) {
 	if err != nil {
 		t.Fatalf("jobRootDir: %v", err)
 	}
-	mapPath := filepath.Join(jobRootDir, ModelMapFileName)
+	mapPath := filepath.Join(jobRootDir, modelMapFileName)
 	mapBytes, err := os.ReadFile(mapPath)
 	if err != nil {
 		t.Fatalf("read model_map.json: %v", err)
 	}
-	var mm ModelMapFile
+	var mm modelMapFile
 	if err := json.Unmarshal(mapBytes, &mm); err != nil {
 		t.Fatalf("unmarshal model_map.json: %v", err)
 	}
@@ -260,9 +260,9 @@ func TestPreProcess_SystemPrompts_PrefixHashAndSortOrder(t *testing.T) {
 		t.Fatalf("jobRootDir: %v", err)
 	}
 
-	mm, err := ReadModelMap(jobRootDir)
+	mm, err := readModelMap(jobRootDir)
 	if err != nil {
-		t.Fatalf("ReadModelMap: %v", err)
+		t.Fatalf("readModelMap: %v", err)
 	}
 
 	safeID := mm.ModelToSafe["m1"]
@@ -1615,9 +1615,9 @@ func TestPreProcess_UnregisteredModel_RejectedToErrorFile(t *testing.T) {
 
 	// model_map.json should record 1 rejected request
 	jobRootDir, _ := p.jobRootDir(jobID, tenantID)
-	mm, err := ReadModelMap(jobRootDir)
+	mm, err := readModelMap(jobRootDir)
 	if err != nil {
-		t.Fatalf("ReadModelMap: %v", err)
+		t.Fatalf("readModelMap: %v", err)
 	}
 	if mm.RejectedCount != 1 {
 		t.Fatalf("RejectedCount = %d, want 1", mm.RejectedCount)
@@ -1726,9 +1726,9 @@ func TestPreProcess_AllRequestsUnregistered_ExecuteJobCounts(t *testing.T) {
 	}
 
 	jobRootDir, _ := p.jobRootDir(jobID, tenantID)
-	mm, err := ReadModelMap(jobRootDir)
+	mm, err := readModelMap(jobRootDir)
 	if err != nil {
-		t.Fatalf("ReadModelMap: %v", err)
+		t.Fatalf("readModelMap: %v", err)
 	}
 	if mm.RejectedCount != 3 {
 		t.Fatalf("RejectedCount = %d, want 3", mm.RejectedCount)

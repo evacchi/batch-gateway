@@ -1,8 +1,7 @@
-package pipeline
+package worker
 
 import (
 	"context"
-	"encoding/binary"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -13,6 +12,7 @@ import (
 	"github.com/go-logr/logr"
 
 	"github.com/llm-d/llm-d-batch-gateway/internal/processor/config"
+	"github.com/llm-d/llm-d-batch-gateway/internal/processor/pipeline"
 	batch_types "github.com/llm-d/llm-d-batch-gateway/internal/shared/types"
 	"github.com/llm-d/llm-d-batch-gateway/pkg/clients/inference"
 )
@@ -209,35 +209,17 @@ func TestMergeHeaders(t *testing.T) {
 	})
 }
 
-func writePlanEntries(t *testing.T, path string, entries []PlanEntry) {
-	t.Helper()
-	f, err := os.Create(path)
-	if err != nil {
-		t.Fatalf("create plan file: %v", err)
-	}
-	defer f.Close()
-	var buf [planEntrySize]byte
-	for _, e := range entries {
-		binary.LittleEndian.PutUint64(buf[0:8], uint64(e.Offset))
-		binary.LittleEndian.PutUint32(buf[8:12], e.Length)
-		binary.LittleEndian.PutUint32(buf[12:16], e.PrefixHash)
-		if _, err := f.Write(buf[:]); err != nil {
-			t.Fatalf("write plan entry: %v", err)
-		}
-	}
-}
-
 func TestReadPlanEntries(t *testing.T) {
 	t.Run("reads entries correctly", func(t *testing.T) {
 		dir := t.TempDir()
-		path := filepath.Join(dir, "test.plan")
-		want := []PlanEntry{
+		plansDir := filepath.Join(dir, "plans")
+		want := []planEntry{
 			{Offset: 0, Length: 100, PrefixHash: 42},
 			{Offset: 100, Length: 200, PrefixHash: 99},
 		}
-		writePlanEntries(t, path, want)
+		writePlanFile(t, plansDir, "test", want)
 
-		got, err := readPlanEntries(path)
+		got, err := readPlanEntries(filepath.Join(plansDir, "test.plan"))
 		if err != nil {
 			t.Fatalf("readPlanEntries: %v", err)
 		}
@@ -295,7 +277,7 @@ func TestPlanFileSource_Produce(t *testing.T) {
 	}
 
 	inputPath := filepath.Join(dir, "input.jsonl")
-	var entries []PlanEntry
+	var entries []planEntry
 	f, err := os.Create(inputPath)
 	if err != nil {
 		t.Fatal(err)
@@ -304,7 +286,7 @@ func TestPlanFileSource_Produce(t *testing.T) {
 		data, _ := json.Marshal(req)
 		data = append(data, '\n')
 		offset, _ := f.Seek(0, 1)
-		entries = append(entries, PlanEntry{
+		entries = append(entries, planEntry{
 			Offset: offset,
 			Length: uint32(len(data)),
 		})
@@ -315,10 +297,7 @@ func TestPlanFileSource_Produce(t *testing.T) {
 	f.Close()
 
 	plansDir := filepath.Join(dir, "plans")
-	if err := os.MkdirAll(plansDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	writePlanEntries(t, filepath.Join(plansDir, "m1.plan"), entries)
+	writePlanFile(t, plansDir, "m1", entries)
 
 	inputFile, err := os.Open(inputPath)
 	if err != nil {
@@ -326,25 +305,25 @@ func TestPlanFileSource_Produce(t *testing.T) {
 	}
 	defer inputFile.Close()
 
-	client := &mockInferenceClient{response: []byte(`{"ok":true}`)}
+	client := &mockInferenceClient{}
 	resolver := inference.NewSingleClientResolver(client)
 	defer func() { _ = resolver.Close() }()
 
 	source := NewPlanFileSource(PlanFileSourceConfig{
 		InputFile: inputFile,
 		PlansDir:  plansDir,
-		ModelMap:  &ModelMap{SafeToModel: map[string]string{"m1": "m1"}, LineCount: 2},
+		ModelMap:  &modelMapFile{SafeToModel: map[string]string{"m1": "m1"}, LineCount: 2},
 		Resolver:  resolver,
 		Cfg:       config.NewConfig(),
 		Logger:    logr.Discard(),
 	})
 
-	out := make(chan RequestItem, 10)
+	out := make(chan pipeline.RequestItem, 10)
 	if err := source.Produce(context.Background(), out); err != nil {
 		t.Fatalf("Produce error: %v", err)
 	}
 
-	var items []RequestItem
+	var items []pipeline.RequestItem
 	for item := range out {
 		items = append(items, item)
 	}
@@ -400,13 +379,10 @@ func TestPlanFileSource_Produce_MultipleModels(t *testing.T) {
 	f.Close()
 
 	plansDir := filepath.Join(dir, "plans")
-	if err := os.MkdirAll(plansDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
 
-	var m1Entries, m2Entries []PlanEntry
+	var m1Entries, m2Entries []planEntry
 	for _, l := range lines {
-		entry := PlanEntry{Offset: l.offset, Length: l.length}
+		entry := planEntry{Offset: l.offset, Length: l.length}
 		switch l.model {
 		case "m1":
 			m1Entries = append(m1Entries, entry)
@@ -414,8 +390,8 @@ func TestPlanFileSource_Produce_MultipleModels(t *testing.T) {
 			m2Entries = append(m2Entries, entry)
 		}
 	}
-	writePlanEntries(t, filepath.Join(plansDir, "m1.plan"), m1Entries)
-	writePlanEntries(t, filepath.Join(plansDir, "m2.plan"), m2Entries)
+	writePlanFile(t, plansDir, "m1", m1Entries)
+	writePlanFile(t, plansDir, "m2", m2Entries)
 
 	inputFile, err := os.Open(inputPath)
 	if err != nil {
@@ -423,14 +399,14 @@ func TestPlanFileSource_Produce_MultipleModels(t *testing.T) {
 	}
 	defer inputFile.Close()
 
-	client := &mockInferenceClient{response: []byte(`{"ok":true}`)}
+	client := &mockInferenceClient{}
 	resolver := inference.NewSingleClientResolver(client)
 	defer func() { _ = resolver.Close() }()
 
 	source := NewPlanFileSource(PlanFileSourceConfig{
 		InputFile: inputFile,
 		PlansDir:  plansDir,
-		ModelMap: &ModelMap{
+		ModelMap: &modelMapFile{
 			SafeToModel: map[string]string{"m1": "m1", "m2": "m2"},
 			LineCount:   3,
 		},
@@ -439,12 +415,12 @@ func TestPlanFileSource_Produce_MultipleModels(t *testing.T) {
 		Logger:   logr.Discard(),
 	})
 
-	out := make(chan RequestItem, 10)
+	out := make(chan pipeline.RequestItem, 10)
 	if err := source.Produce(context.Background(), out); err != nil {
 		t.Fatalf("Produce error: %v", err)
 	}
 
-	var items []RequestItem
+	var items []pipeline.RequestItem
 	for item := range out {
 		items = append(items, item)
 	}
@@ -482,20 +458,20 @@ func TestPlanFileSource_Produce_BadPlanFile(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	client := &mockInferenceClient{response: []byte(`{"ok":true}`)}
+	client := &mockInferenceClient{}
 	resolver := inference.NewSingleClientResolver(client)
 	defer func() { _ = resolver.Close() }()
 
 	source := NewPlanFileSource(PlanFileSourceConfig{
 		InputFile: inputFile,
 		PlansDir:  plansDir,
-		ModelMap:  &ModelMap{SafeToModel: map[string]string{"m1": "m1"}, LineCount: 1},
+		ModelMap:  &modelMapFile{SafeToModel: map[string]string{"m1": "m1"}, LineCount: 1},
 		Resolver:  resolver,
 		Cfg:       config.NewConfig(),
 		Logger:    logr.Discard(),
 	})
 
-	out := make(chan RequestItem, 10)
+	out := make(chan pipeline.RequestItem, 10)
 	err = source.Produce(context.Background(), out)
 	if err == nil {
 		t.Fatal("expected error for missing plan file")
