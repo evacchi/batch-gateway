@@ -6,7 +6,6 @@ import (
 
 	"github.com/go-logr/logr"
 
-	"github.com/llm-d/llm-d-batch-gateway/internal/processor/metrics"
 	batch_types "github.com/llm-d/llm-d-batch-gateway/internal/shared/types"
 	"github.com/llm-d/llm-d-batch-gateway/pkg/clients/inference"
 )
@@ -37,31 +36,29 @@ func NewAsyncDispatcher(
 	}
 }
 
+func AsyncDispatcherStage(
+	resolver *inference.AsyncGatewayResolver,
+	broadcasters *BroadcasterGroup,
+	pending *PendingRequests,
+	logger logr.Logger,
+) ResultDispatcherStage {
+	return func(_ RequestDispatcher) RequestDispatcher {
+		return NewAsyncDispatcher(resolver, broadcasters, pending, logger)
+	}
+}
+
 func (d *AsyncDispatcher) Run(ctx context.Context, requestCh <-chan RequestItem, resultCh chan<- ResultItem) error {
 	d.broadcasters.Subscribe(resultCh)
 
 	// Submit phase — fast queue writes.
 	for msg := range requestCh {
-		if ctx.Err() != nil {
-			resultCh <- *msg.Error(cancelCode(ctx))
-			break
-		}
-
-		if msg.ParseError != nil {
-			resultCh <- *msg.Error(msg.ParseError.Code, msg.ParseError.Message)
-			continue
-		}
-
 		client := d.resolver.SharedClientFor(msg.ModelID)
 		if client == nil {
 			resultCh <- *msg.ModelNotFound()
 			continue
 		}
 
-		msg.SubmittedAt = time.Now()
 		d.pending.Store(msg)
-		metrics.IncProcessorInflightRequests()
-		metrics.IncModelInflightRequests(msg.ModelID)
 
 		req := &inference.GenerateRequest{
 			RequestID: msg.RequestID,
@@ -77,11 +74,6 @@ func (d *AsyncDispatcher) Run(ctx context.Context, requestCh <-chan RequestItem,
 			)
 			continue
 		}
-	}
-
-	// Drain remaining requests (if loop broke early).
-	for msg := range requestCh {
-		resultCh <- *msg.Error(cancelCode(ctx))
 	}
 
 	// Wait for all pending results to be resolved by the collector.
