@@ -20,6 +20,7 @@ package common
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -103,14 +104,21 @@ file_client:
 				// Create temporary YAML config file
 				tmpDir := t.TempDir()
 				configFile := filepath.Join(tmpDir, tt.fileName)
-				if err := os.WriteFile(configFile, []byte(tt.yamlConfig), 0644); err != nil {
-					t.Fatalf("Failed to create test config file: %v", err)
+				yamlConfig := tt.yamlConfig
+				want := tt.want
+
+				// Keep TLS fixtures isolated to this subtest. Relative shared files
+				// can be removed by another test invocation while this test runs.
+				if tt.want.SSLCertFile != "" {
+					certFile, keyFile := setupTestSSLFiles(t, tmpDir)
+					yamlConfig = strings.ReplaceAll(yamlConfig, "testdata/cert.pem", certFile)
+					yamlConfig = strings.ReplaceAll(yamlConfig, "testdata/key.pem", keyFile)
+					want.SSLCertFile = certFile
+					want.SSLKeyFile = keyFile
 				}
 
-				// Setup test SSL files if needed
-				if tt.want.SSLCertFile != "" {
-					setupTestSSLFiles(t)
-					defer cleanupTestSSLFiles(t)
+				if err := os.WriteFile(configFile, []byte(yamlConfig), 0644); err != nil {
+					t.Fatalf("Failed to create test config file: %v", err)
 				}
 
 				// Save original os.Args and restore after test
@@ -136,11 +144,11 @@ file_client:
 					if config.Port != tt.want.Port {
 						t.Errorf("Port = %v, want %v", config.Port, tt.want.Port)
 					}
-					if config.SSLCertFile != tt.want.SSLCertFile {
-						t.Errorf("SSLCertFile = %v, want %v", config.SSLCertFile, tt.want.SSLCertFile)
+					if config.SSLCertFile != want.SSLCertFile {
+						t.Errorf("SSLCertFile = %v, want %v", config.SSLCertFile, want.SSLCertFile)
 					}
-					if config.SSLKeyFile != tt.want.SSLKeyFile {
-						t.Errorf("SSLKeyFile = %v, want %v", config.SSLKeyFile, tt.want.SSLKeyFile)
+					if config.SSLKeyFile != want.SSLKeyFile {
+						t.Errorf("SSLKeyFile = %v, want %v", config.SSLKeyFile, want.SSLKeyFile)
 					}
 				}
 			})
@@ -290,27 +298,21 @@ func TestGetTenantHeader(t *testing.T) {
 }
 
 // Helper functions
-func setupTestSSLFiles(t *testing.T) {
-	// Create testdata directory
-	if err := os.MkdirAll("testdata", 0755); err != nil {
-		t.Fatalf("Failed to create testdata directory: %v", err)
-	}
+func setupTestSSLFiles(t *testing.T, dir string) (string, string) {
+	certFile := filepath.Join(dir, "cert.pem")
+	keyFile := filepath.Join(dir, "key.pem")
 
 	// Create dummy cert file
 	certContent := []byte("-----BEGIN CERTIFICATE-----\nDUMMY CERT\n-----END CERTIFICATE-----")
-	if err := os.WriteFile("testdata/cert.pem", certContent, 0644); err != nil {
+	if err := os.WriteFile(certFile, certContent, 0644); err != nil {
 		t.Fatalf("Failed to create cert file: %v", err)
 	}
 
 	// Create dummy key file
 	keyContent := []byte("-----BEGIN PRIVATE KEY-----\nDUMMY KEY\n-----END PRIVATE KEY-----")
-	if err := os.WriteFile("testdata/key.pem", keyContent, 0644); err != nil {
+	if err := os.WriteFile(keyFile, keyContent, 0644); err != nil {
 		t.Fatalf("Failed to create key file: %v", err)
 	}
-}
 
-func cleanupTestSSLFiles(t *testing.T) {
-	if err := os.RemoveAll("testdata"); err != nil {
-		t.Logf("Failed to cleanup testdata directory: %v", err)
-	}
+	return certFile, keyFile
 }
